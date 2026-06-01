@@ -1,0 +1,1943 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║  МІКРОСЕРВІСНА СИСТЕМА ПЕРСОНАЛІЗОВАНИХ РЕКОМЕНДАЦІЙ            ║
+║  НАУКОВИХ МАТЕРІАЛІВ З ІНТЕГРАЦІЄЮ ML-МОДЕЛЕЙ                   ║
+║                                                                  ║
+║  Запуск:  python app.py                                          ║
+║  Браузер: http://localhost:5000                                  ║
+║                                                                  ║
+║  Залежності: pip install flask numpy scipy scikit-learn          ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+# ══════════════════════════════════════════════════════════════════
+#  PYTHON / ML БЕКЕНД
+# ══════════════════════════════════════════════════════════════════
+import random, time, logging, json, os
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple
+from datetime import datetime
+
+import numpy as np
+from scipy.sparse import csr_matrix, vstack as sp_vstack
+from scipy.sparse.linalg import svds
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from flask import Flask, jsonify, request
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%H:%M:%S")
+logger = logging.getLogger(__name__)
+
+# ── Моделі даних ──────────────────────────────────────────────────
+
+@dataclass
+class Author:
+    id: str; name: str; affiliation: str; h_index: int = 0
+
+@dataclass
+class Paper:
+    id: str; title: str; abstract: str; authors: List[Author]
+    keywords: List[str]; year: int; venue: str; citations: int
+    doi: Optional[str] = None; full_text_available: bool = False
+    def to_dict(self):
+        return {"id":self.id,"title":self.title,"abstract":self.abstract,
+                "authors":[{"id":a.id,"name":a.name,"affiliation":a.affiliation} for a in self.authors],
+                "keywords":self.keywords,"year":self.year,"venue":self.venue,
+                "citations":self.citations,"doi":self.doi,"open_access":self.full_text_available}
+
+@dataclass
+class UserProfile:
+    user_id:str; name:str; research_interests:List[str]; institution:str
+    viewed_papers:List[str]=field(default_factory=list)
+    liked_papers:List[str]=field(default_factory=list)
+    saved_papers:List[str]=field(default_factory=list)
+    interaction_history:List[Dict]=field(default_factory=list)
+    def add_interaction(self, paper_id:str, action:str):
+        self.interaction_history.append({"paper_id":paper_id,"action":action,"timestamp":datetime.now().isoformat()})
+        if action=="view" and paper_id not in self.viewed_papers: self.viewed_papers.append(paper_id)
+        elif action=="like" and paper_id not in self.liked_papers: self.liked_papers.append(paper_id)
+        elif action=="save" and paper_id not in self.saved_papers: self.saved_papers.append(paper_id)
+    def to_dict(self, full=False):
+        d = {"user_id":self.user_id,"name":self.name,"research_interests":self.research_interests,
+             "institution":self.institution,"viewed":len(self.viewed_papers),
+             "liked":len(self.liked_papers),"saved":len(self.saved_papers)}
+        if full:
+            d["viewed_papers"]  = self.viewed_papers
+            d["liked_papers"]   = self.liked_papers
+            d["saved_papers"]   = self.saved_papers
+            d["interaction_history"] = self.interaction_history[-50:]
+        return d
+
+# ── Persistence: збереження/завантаження профілів ─────────────────
+USERS_FILE = "users.json"
+
+def save_users(users):
+    data = []
+    for u in users:
+        data.append({
+            "user_id": u.user_id,
+            "name": u.name,
+            "research_interests": u.research_interests,
+            "institution": u.institution,
+            "viewed_papers": u.viewed_papers,
+            "liked_papers": u.liked_papers,
+            "saved_papers": u.saved_papers,
+        })
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.info(f"Saved {len(data)} users to {USERS_FILE}")
+
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        logger.info("No users.json found, using defaults")
+        return generate_users()
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        users = []
+        for d in data:
+            u = UserProfile(
+                d["user_id"], d["name"],
+                d.get("research_interests", []),
+                d.get("institution", ""),
+            )
+            u.viewed_papers = d.get("viewed_papers", [])
+            u.liked_papers  = d.get("liked_papers", [])
+            u.saved_papers  = d.get("saved_papers", [])
+            users.append(u)
+        logger.info(f"Loaded {len(users)} users from {USERS_FILE}")
+        return users
+    except Exception as e:
+        logger.warning(f"Failed to load users.json: {e}. Using defaults.")
+        return generate_users()
+
+
+# ── Генератор датасету ────────────────────────────────────────────
+DOMAINS = {
+    "machine_learning":{"keywords":["neural network","deep learning","gradient descent","transformer",
+        "attention mechanism","BERT","GPT","reinforcement learning","convolutional network","GAN","diffusion model"],
+        "venues":["NeurIPS","ICML","ICLR","AAAI","CVPR"],
+        "topics":["Image Classification","NLP","Graph Neural Networks","Meta-Learning","Self-Supervised Learning","Knowledge Distillation"]},
+    "data_science":{"keywords":["data mining","feature engineering","clustering","anomaly detection",
+        "time series","statistical learning","dimensionality reduction","ensemble methods","Bayesian inference"],
+        "venues":["KDD","SIGMOD","VLDB","WWW","WSDM"],
+        "topics":["Big Data Analytics","Stream Processing","Data Quality","Causal Inference","A/B Testing","Data Visualization"]},
+    "nlp":{"keywords":["tokenization","word embeddings","sentiment analysis","named entity recognition",
+        "machine translation","question answering","text summarization","language model","semantic similarity"],
+        "venues":["ACL","EMNLP","NAACL","COLING","EACL"],
+        "topics":["Low-Resource NLP","Multilingual Models","Dialogue Systems","Information Extraction","Text Generation","Commonsense Reasoning"]},
+    "computer_vision":{"keywords":["object detection","semantic segmentation","pose estimation",
+        "3D reconstruction","optical flow","image synthesis","depth estimation","face recognition","visual grounding"],
+        "venues":["CVPR","ICCV","ECCV","WACV","BMVC"],
+        "topics":["Medical Image Analysis","Remote Sensing","Autonomous Driving","Video Understanding","Visual Question Answering","Multimodal Learning"]},
+    "distributed_systems":{"keywords":["microservices","containerization","Kubernetes","service mesh",
+        "event-driven architecture","CQRS","eventual consistency","distributed tracing","load balancing","fault tolerance"],
+        "venues":["OSDI","SOSP","EuroSys","NSDI","USENIX ATC"],
+        "topics":["Cloud Computing","Edge Computing","Serverless","Consensus Algorithms","Distributed Databases","Stream Processing Systems"]},
+    "bioinformatics":{"keywords":["genome sequencing","protein structure","gene expression",
+        "phylogenetics","CRISPR","RNA-seq","single-cell analysis","drug discovery","molecular dynamics"],
+        "venues":["Bioinformatics","RECOMB","ISMB","PSB","Cell Systems"],
+        "topics":["Protein Folding","Cancer Genomics","Microbiome Analysis","Computational Drug Design","Epigenomics","Structural Biology"]},
+}
+_INST=["MIT","Stanford University","Carnegie Mellon University","UC Berkeley","Oxford University","ETH Zurich",
+       "Kyiv Polytechnic Institute","University of Toronto","Cambridge University","TU Munich",
+       "National Academy of Sciences of Ukraine","Harvard University","Google DeepMind","OpenAI","Meta AI Research"]
+_FN=["Oleksiy","Maria","Ivan","Natalia","Dmytro","Oksana","John","Sarah","Michael","Emma","Hiroshi","Priya","Alexandre","Chen","Lars"]
+_LN=["Kovalenko","Smith","Johnson","Zhang","Müller","Patel","Dubois","García","Okafor","Tanaka","Ivanov","Brown","Shevchenko","Kim","Lee"]
+
+def _author(rng,aid): return Author(f"A{aid:04d}",f"{rng.choice(_FN)} {rng.choice(_LN)}",rng.choice(_INST),rng.randint(2,45))
+def _paper(rng,pid,domain):
+    d=DOMAINS[domain]; topic=rng.choice(d["topics"]); kws=rng.sample(d["keywords"],k=rng.randint(3,6)); year=rng.randint(2018,2024)
+    titles=[f"{topic} via {kws[0].title()} and {kws[1].title()}",
+            f"Towards Efficient {topic}: A {kws[0].title()}-Based Approach",
+            f"Rethinking {kws[0].title()} for {topic}",
+            f"A Unified Framework for {topic} with {kws[1].title()}",
+            f"Scalable {topic} Using {kws[0].title()}",
+            f"Self-Supervised {topic} with {kws[1].title()} Pretraining"]
+    abs_=[f"We present a novel approach to {topic.lower()} leveraging {kws[0]} techniques. Our method integrates {kws[1]} with {kws[2]} to address key challenges in the field. Extensive experiments on benchmark datasets demonstrate state-of-the-art performance, outperforming existing methods by a significant margin. We further analyze the theoretical properties of our approach and provide convergence guarantees under mild assumptions.",
+          f"This paper introduces a new paradigm for {topic.lower()} based on {kws[0]}. Unlike prior work that relies on {kws[1]}, our framework directly optimizes the end-to-end objective using {kws[2]}. We validate our approach on multiple real-world datasets and show significant improvements in both accuracy and computational efficiency. Code and pretrained models are released publicly.",
+          f"Recent advances in {kws[0]} have shown promising results for {topic.lower()}. However, existing approaches suffer from scalability issues in large-scale settings. We propose a novel {kws[1]}-based method that overcomes these limitations. Our key insight is that {kws[2]} can significantly reduce computational overhead while maintaining high accuracy."]
+    return Paper(f"P{pid:05d}",rng.choice(titles),rng.choice(abs_),
+                 [_author(rng,pid*10+i) for i in range(rng.randint(2,5))],
+                 kws+[domain.replace("_"," ")],year,rng.choice(d["venues"]),rng.randint(0,1200),
+                 f"10.{rng.randint(1000,9999)}/{domain[:3]}.{year}.{pid:05d}",rng.random()>0.4)
+
+def generate_dataset(n=200):
+    rng=random.Random(42); domains=list(DOMAINS.keys()); papers=[]; pid=1
+    for domain in domains:
+        for _ in range(n//len(domains)): papers.append(_paper(rng,pid,domain)); pid+=1
+    while len(papers)<n: papers.append(_paper(rng,pid,rng.choice(domains))); pid+=1
+    rng.shuffle(papers); return papers
+
+def generate_users():
+    return [UserProfile("U001","Олексій Коваленко",["machine learning","deep learning","natural language processing"],"Kyiv Polytechnic Institute"),
+            UserProfile("U002","Maria Schmidt",["computer vision","medical image analysis","deep learning"],"ETH Zurich"),
+            UserProfile("U003","Dmytro Shevchenko",["distributed systems","microservices","cloud computing"],"National Academy of Sciences of Ukraine"),
+            UserProfile("U004","Priya Patel",["bioinformatics","protein folding","drug discovery"],"Carnegie Mellon University"),
+            UserProfile("U005","Chen Wei",["data science","time series","anomaly detection"],"Tsinghua University")]
+
+# ── ML сервіси ────────────────────────────────────────────────────
+class ContentBasedService:
+    def __init__(self):
+        self.vectorizer=TfidfVectorizer(max_features=5000,stop_words="english",ngram_range=(1,2),min_df=1,sublinear_tf=True)
+        self.paper_vectors=None; self.paper_ids=[]; self.is_fitted=False
+    def fit(self,papers):
+        corpus,self.paper_ids=[],[]
+        for p in papers:
+            corpus.append(f"{p.title} {p.title} {p.abstract} {' '.join(p.keywords)} {' '.join(p.keywords)} {p.venue}".lower())
+            self.paper_ids.append(p.id)
+        self.paper_vectors=self.vectorizer.fit_transform(corpus); self.is_fitted=True
+        logger.info(f"[CB] Fitted. Vocab: {len(self.vectorizer.vocabulary_)}")
+    def _uv(self,user):
+        it=" ".join(user.research_interests)*3
+        pos=user.liked_papers+user.saved_papers
+        if not pos and not user.viewed_papers: return self.vectorizer.transform([it.lower()])
+        vecs=[self.vectorizer.transform([it.lower()])]; ws=[2.0]
+        for pid in pos:
+            if pid in self.paper_ids: vecs.append(self.paper_vectors[self.paper_ids.index(pid)]); ws.append(3.0)
+        for pid in user.viewed_papers[:10]:
+            if pid in self.paper_ids: vecs.append(self.paper_vectors[self.paper_ids.index(pid)]); ws.append(1.0)
+        st=sp_vstack(vecs); wt=st.multiply(np.array(ws).reshape(-1,1))
+        return csr_matrix(np.asarray(wt.sum(axis=0)))
+    def recommend(self,user,papers,top_k=20,exclude=None):
+        pm={p.id:p for p in papers}; ex=set(exclude or [])|set(user.viewed_papers)
+        sims=cosine_similarity(self._uv(user),self.paper_vectors).flatten()
+        res=[]
+        for pid,s in zip(self.paper_ids,sims):
+            if pid in ex: continue
+            p=pm.get(pid)
+            if p:
+                ov=set(" ".join(user.research_interests).lower().split())&set(" ".join(p.keywords).lower().split())
+                reason=f"Matches: {', '.join(sorted(ov)[:3])}" if ov else f"Related: {', '.join(p.keywords[:2])}"
+                res.append((p,float(s),reason))
+        res.sort(key=lambda x:x[1],reverse=True); return res[:top_k]
+    def similar(self,pid,papers,top_k=8):
+        if pid not in self.paper_ids: return []
+        pm={p.id:p for p in papers}; idx=self.paper_ids.index(pid)
+        sims=cosine_similarity(self.paper_vectors[idx],self.paper_vectors).flatten()
+        res=[(pm[p],float(s),"Content similarity") for p,s in zip(self.paper_ids,sims) if p!=pid and p in pm]
+        res.sort(key=lambda x:x[1],reverse=True); return res[:top_k]
+    @property
+    def status(self): return {"service":"ContentBasedService","status":"healthy" if self.is_fitted else "init","model":"TF-IDF + Cosine Similarity","vocab_size":len(self.vectorizer.vocabulary_) if self.is_fitted else 0,"papers_indexed":len(self.paper_ids)}
+
+class CollaborativeFilteringService:
+    def __init__(self,n=15):
+        self.n=n; self.uf=self.itf=self.sig=None; self.uids=[]; self.pids=[]; self.mat=None; self.fitted=False
+    def fit(self,users,papers):
+        self.uids=[u.user_id for u in users]; self.pids=[p.id for p in papers]
+        pidx={p:i for i,p in enumerate(self.pids)}; uidx={u:i for i,u in enumerate(self.uids)}
+        rows,cols,data=[],[],[]
+        for u in users:
+            ui=uidx[u.user_id]
+            for pid in u.viewed_papers:
+                if pid in pidx: rows.append(ui);cols.append(pidx[pid]);data.append(1.0)
+            for pid in u.liked_papers:
+                if pid in pidx: rows.append(ui);cols.append(pidx[pid]);data.append(3.0)
+            for pid in u.saved_papers:
+                if pid in pidx: rows.append(ui);cols.append(pidx[pid]);data.append(5.0)
+        if not data: self._synth(users,papers,pidx,uidx,rows,cols,data)
+        self.mat=csr_matrix((data,(rows,cols)),shape=(len(self.uids),len(self.pids)),dtype=np.float32)
+        k=min(self.n,min(len(self.uids),len(self.pids))-1)
+        U,sig,VT=svds(self.mat.astype(float),k=k); idx=np.argsort(sig)[::-1]
+        self.sig=sig[idx]; self.uf=U[:,idx]; self.itf=VT[idx,:]; self.fitted=True
+        logger.info(f"[CF] SVD done. Explained var: {self._ev():.1%}")
+    def _synth(self,users,papers,pidx,uidx,rows,cols,data):
+        rng=random.Random(42); dm={}
+        for p in papers:
+            for kw in p.keywords: dm.setdefault(kw.lower(),[]).append(p.id)
+        for u in users:
+            ui=uidx[u.user_id]; rel=[]
+            for i in u.research_interests:
+                for kw,ps in dm.items():
+                    if i.lower() in kw or kw in i.lower(): rel.extend(ps[:15])
+            if not rel: rel=[p.id for p in rng.sample(papers,min(10,len(papers)))]
+            for pid in rng.sample(rel,min(8,len(rel))):
+                if pid in pidx: rows.append(ui);cols.append(pidx[pid]);data.append(1.0)
+            for pid in rng.sample(rel,min(4,len(rel))):
+                if pid in pidx: rows.append(ui);cols.append(pidx[pid]);data.append(3.0)
+    def _ev(self):
+        if self.sig is None or self.mat is None: return 0
+        t=(self.mat.data**2).sum(); return min((self.sig**2).sum()/(t+1e-10),1.0)
+    def recommend(self,uid,papers,top_k=20,exclude=None):
+        if not self.fitted or uid not in self.uids: return []
+        pm={p.id:p for p in papers}; ex=set(exclude or [])
+        ui=self.uids.index(uid); scores=self.uf[ui]@np.diag(self.sig)@self.itf
+        res=[(pm[pid],float(s),"Recommended by users with similar interests")
+             for pid,s in zip(self.pids,scores) if pid not in ex and pid in pm]
+        res.sort(key=lambda x:x[1],reverse=True); return res[:top_k]
+    def similar_users(self,uid,top_k=3):
+        if not self.fitted or uid not in self.uids: return []
+        ui=self.uids.index(uid); sims=cosine_similarity(self.uf[ui].reshape(1,-1),self.uf).flatten()
+        res=[(self.uids[i],float(sims[i])) for i in range(len(self.uids)) if self.uids[i]!=uid]
+        res.sort(key=lambda x:x[1],reverse=True); return res[:top_k]
+    @property
+    def status(self): return {"service":"CollaborativeFilteringService","status":"healthy" if self.fitted else "init","model":f"SVD Matrix Factorization (k={self.n})","matrix_shape":f"{len(self.uids)}×{len(self.pids)}" if self.fitted else "N/A","explained_variance":f"{self._ev():.1%}" if self.fitted else "N/A"}
+
+class KnowledgeGraphService:
+    def __init__(self,d=0.85,mi=100):
+        self.d=d; self.mi=mi; self.cg={}; self.kg={}; self.pg={}; self.pr={}; self.pids=[]; self.fitted=False
+    def fit(self,papers):
+        self.pids=[p.id for p in papers]; rng=random.Random(123)
+        for p in papers:
+            for kw in p.keywords: self.kg.setdefault(kw.lower(),set()).add(p.id)
+        sp=sorted(papers,key=lambda p:p.year)
+        for i,p in enumerate(sp):
+            self.cg.setdefault(p.id,set()); self.pg.setdefault(p.id,set())
+            cands=[c for c in sp[:i] if set(c.keywords)&set(p.keywords)]
+            for c in rng.sample(cands,min(len(cands),rng.randint(2,8))):
+                self.cg.setdefault(c.id,set()).add(p.id)
+                self.pg[p.id].add(c.id); self.pg.setdefault(c.id,set()).add(p.id)
+        self.pr=self._pagerank(); self.fitted=True
+        logger.info(f"[KG] Graph built. Nodes:{len(self.pids)} Edges:{sum(len(v) for v in self.pg.values())}")
+    def _pagerank(self):
+        n=len(self.pids)
+        if not n: return {}
+        sc={p:1/n for p in self.pids}
+        for it in range(self.mi):
+            ns={}
+            for p in self.pids:
+                rs=sum(sc.get(c,0)/max(len(self.pg.get(c,set())),1) for c in self.cg.get(p,set()))
+                ns[p]=(1-self.d)/n+self.d*rs
+            if sum(abs(ns[p]-sc[p]) for p in self.pids)<1e-6: break
+            sc=ns
+        mx=max(sc.values()) or 1; return {p:s/mx for p,s in sc.items()}
+    def recommend(self,user,papers,top_k=20,exclude=None):
+        pm={p.id:p for p in papers}; ex=set(exclude or [])|set(user.viewed_papers); cs={}
+        for i in user.research_interests:
+            for w in i.lower().split():
+                for kw,ps in self.kg.items():
+                    if w in kw or kw in w:
+                        for p in ps:
+                            if p not in ex: cs[p]=cs.get(p,0)+1
+        for pid,rel in list(cs.items()):
+            for n in self.pg.get(pid,set()):
+                if n not in ex and n not in cs: cs[n]=cs.get(n,0)+rel*0.5
+        res=[]
+        for pid,rel in cs.items():
+            p=pm.get(pid)
+            if p:
+                pr=self.pr.get(pid,0); cite=min(p.citations/500,1)
+                res.append((p,rel*0.5+pr*0.3+cite*0.2,f"Citation impact ({p.citations} cit., PageRank:{pr:.3f})"))
+        res.sort(key=lambda x:x[1],reverse=True); return res[:top_k]
+    @property
+    def status(self): return {"service":"KnowledgeGraphService","status":"healthy" if self.fitted else "init","model":f"Knowledge Graph + PageRank (d={self.d})","nodes":len(self.pids),"edges":sum(len(v) for v in self.pg.values()),"keywords":len(self.kg)}
+
+class HybridService:
+    def __init__(self,cb,cf,kg):
+        self.cb=cb; self.cf=cf; self.kg=kg
+        self.weights={"content_based":0.40,"collaborative":0.35,"knowledge_graph":0.25}
+    def recommend(self,user,papers,top_k=10,lam=0.3):
+        t0=time.time(); ex=set(user.viewed_papers); sm={}
+        def collect(res,key):
+            if not res: return
+            mx=max(s for _,s,_ in res)+1e-9; mn=min(s for _,s,_ in res)
+            rng_=mx-mn+1e-9
+            icons={"content_based":"📄","collaborative":"👥","knowledge_graph":"🔗"}
+            for p,s,r in res:
+                e=sm.setdefault(p.id,{"paper":p,"scores":{},"reasons":[]})
+                e["scores"][key]=(s-mn)/rng_; e["reasons"].append(f"{icons[key]} {r}")
+        try: collect(self.cb.recommend(user,papers,50,list(ex)),"content_based")
+        except Exception as e: logger.warning(f"CB:{e}")
+        try: collect(self.cf.recommend(user.user_id,papers,50,list(ex)),"collaborative")
+        except Exception as e: logger.warning(f"CF:{e}")
+        try: collect(self.kg.recommend(user,papers,50,list(ex)),"knowledge_graph")
+        except Exception as e: logger.warning(f"KG:{e}")
+        for d in sm.values():
+            tw=sum(self.weights[m] for m in d["scores"])
+            d["final"]=sum(self.weights[m]*s for m,s in d["scores"].items())/(tw+1e-9)
+            d["models"]=list(d["scores"].keys())
+        ranked=sorted(sm.values(),key=lambda x:x["final"],reverse=True)
+        sel=self._mmr(ranked,lam,top_k)
+        return {"recommendations":[self._fmt(it,i+1) for i,it in enumerate(sel)],
+                "metadata":{"total":len(sm),"cb":sum(1 for d in sm.values() if "content_based" in d["scores"]),
+                            "cf":sum(1 for d in sm.values() if "collaborative" in d["scores"]),
+                            "kg":sum(1 for d in sm.values() if "knowledge_graph" in d["scores"]),
+                            "latency_ms":round((time.time()-t0)*1000,1),"weights":self.weights,"lambda":lam}}
+    def _mmr(self,cands,lam,k):
+        if not cands: return []
+        if lam>=0.99: return cands[:k]
+        sel=[cands[0]]; rem=cands[1:]
+        while len(sel)<k and rem:
+            best=max(rem,key=lambda it: lam*it["final"]-((1-lam)*max(self._ks(it["paper"],s["paper"]) for s in sel)))
+            sel.append(best); rem.remove(best)
+        return sel
+    def _ks(self,p1,p2):
+        k1=set(k.lower() for k in p1.keywords); k2=set(k.lower() for k in p2.keywords)
+        return len(k1&k2)/len(k1|k2) if k1 and k2 else 0
+    def _fmt(self,it,rank):
+        return {"rank":rank,"score":round(it["final"],4),"models":it["models"],
+                "reasons":list(dict.fromkeys(it["reasons"]))[:3],"paper":it["paper"].to_dict()}
+    @property
+    def status(self): return {"service":"HybridEnsembleService","status":"healthy","model":"Hybrid Ensemble + MMR","weights":self.weights,"sub":[self.cb.status,self.cf.status,self.kg.status]}
+
+# ── Ініціалізація системи ─────────────────────────────────────────
+class RecommendationSystem:
+    def __init__(self):
+        logger.info("Initializing Recommendation System...")
+        self.papers=generate_dataset(200)
+        self.users=load_users()
+        self.users_map={u.user_id:u for u in self.users}
+        self._simulate()
+        self.cb=ContentBasedService(); self.cf=CollaborativeFilteringService(15); self.kg=KnowledgeGraphService()
+        self.cb.fit(self.papers); self.cf.fit(self.users,self.papers); self.kg.fit(self.papers)
+        self.hybrid=HybridService(self.cb,self.cf,self.kg)
+        logger.info("✓ System ready!")
+    def _simulate(self):
+        rng=random.Random(99); dm={}
+        for p in self.papers:
+            for kw in p.keywords: dm.setdefault(kw.lower(),[]).append(p)
+        for u in self.users:
+            rel=list({p.id:p for i in u.research_interests for kw,ps in dm.items() for p in ps if any(w in kw for w in i.lower().split())}.values())
+            if not rel: rel=rng.sample(self.papers,15)
+            s=rng.sample(rel,min(12,len(rel)))
+            for p in s[:8]: u.add_interaction(p.id,"view")
+            for p in s[2:6]: u.add_interaction(p.id,"like")
+            for p in s[4:7]: u.add_interaction(p.id,"save")
+
+SYS=None
+
+# ══════════════════════════════════════════════════════════════════
+#  FLASK ROUTES
+# ══════════════════════════════════════════════════════════════════
+app=Flask(__name__)
+
+@app.route("/")
+def index(): return HTML_PAGE
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({"system":"SciRec","version":"2.0","ready":SYS is not None,
+                    "papers":len(SYS.papers) if SYS else 0,"users":len(SYS.users) if SYS else 0,
+                    "services":SYS.hybrid.status if SYS else {}})
+
+@app.route("/api/users", methods=["GET","POST"])
+def api_users():
+    if request.method == "POST":
+        d = request.json or {}
+        name        = (d.get("name") or "").strip()
+        institution = (d.get("institution") or "").strip()
+        interests   = [i.strip() for i in d.get("interests", []) if i.strip()]
+        if not name:
+            return jsonify({"error": "Iм\'я обов\'язкове"}), 400
+        if not interests:
+            return jsonify({"error": "Вкажiть хоча б один iнтерес"}), 400
+        nums = []
+        for u in SYS.users:
+            if u.user_id.startswith("U"):
+                try: nums.append(int(u.user_id[1:]))
+                except: pass
+        uid = f"U{max(nums, default=0)+1:03d}"
+        user = UserProfile(uid, name, interests, institution or "Не вказано")
+        SYS.users.append(user)
+        SYS.users_map[uid] = user
+        try: SYS.cf.fit(SYS.users, SYS.papers)
+        except Exception as e: logger.warning(f"CF refit: {e}")
+        save_users(SYS.users)
+        logger.info(f"New user: {uid} — {name}")
+        return jsonify({"ok": True, "user": user.to_dict()}), 201
+    return jsonify([u.to_dict() for u in SYS.users])
+
+@app.route("/api/users/<uid>", methods=["PATCH","DELETE"])
+def api_user_edit(uid):
+    user = SYS.users_map.get(uid)
+    if not user:
+        return jsonify({"error": "Користувача не знайдено"}), 404
+
+    if request.method == "DELETE":
+        SYS.users = [u for u in SYS.users if u.user_id != uid]
+        del SYS.users_map[uid]
+        save_users(SYS.users)
+        try: SYS.cf.fit(SYS.users, SYS.papers)
+        except Exception as e: logger.warning(f"CF refit: {e}")
+        logger.info(f"Deleted user: {uid}")
+        return jsonify({"ok": True})
+
+    # PATCH - edit
+    d = request.json or {}
+    if "name" in d:
+        name = d["name"].strip()
+        if not name:
+            return jsonify({"error": "Ім'я не може бути порожнім"}), 400
+        user.name = name
+    if "institution" in d:
+        user.institution = d["institution"].strip() or "Не вказано"
+    if "interests" in d:
+        interests = [i.strip() for i in d["interests"] if i.strip()]
+        if not interests:
+            return jsonify({"error": "Вкажіть хоча б один інтерес"}), 400
+        user.research_interests = interests
+    save_users(SYS.users)
+    try: SYS.cf.fit(SYS.users, SYS.papers)
+    except Exception as e: logger.warning(f"CF refit: {e}")
+    logger.info(f"Updated user: {uid}")
+    return jsonify({"ok": True, "user": user.to_dict()})
+
+@app.route("/api/recommend/<uid>")
+def api_recommend(uid):
+    top_k=int(request.args.get("top_k",10))
+    lam=float(request.args.get("diversity",0.3))
+    user=SYS.users_map.get(uid)
+    if not user: return jsonify({"error":"User not found"}),404
+    result=SYS.hybrid.recommend(user,SYS.papers,top_k=top_k,lam=lam)
+    result["user"]=user.to_dict()
+    return jsonify(result)
+
+@app.route("/api/similar/<pid>")
+def api_similar(pid):
+    results=SYS.cb.similar(pid,SYS.papers,top_k=8)
+    return jsonify([{"paper":p.to_dict(),"score":round(s,4)} for p,s,_ in results])
+
+@app.route("/api/search")
+def api_search():
+    q=request.args.get("q","").lower().split()
+    if not q: return jsonify([])
+    results=[]
+    for p in SYS.papers:
+        text=f"{p.title} {p.abstract} {' '.join(p.keywords)}".lower()
+        score=sum(text.count(w)+p.title.lower().count(w)*5 for w in q)
+        if score>0: results.append((p,score))
+    results.sort(key=lambda x:x[1],reverse=True)
+    return jsonify([{"paper":p.to_dict(),"relevance":s} for p,s in results[:12]])
+
+@app.route("/api/users/<uid>/history")
+def api_user_history(uid):
+    user = SYS.users_map.get(uid)
+    if not user: return jsonify({"error":"Not found"}), 404
+    papers_map = {p.id: p for p in SYS.papers}
+    def enrich(pids):
+        return [papers_map[pid].to_dict() for pid in reversed(pids) if pid in papers_map]
+    return jsonify({
+        "user":    user.to_dict(),
+        "viewed":  enrich(user.viewed_papers),
+        "liked":   enrich(user.liked_papers),
+        "saved":   enrich(user.saved_papers),
+    })
+
+@app.route("/api/interact",methods=["POST"])
+def api_interact():
+    d=request.json; uid=d.get("user_id"); pid=d.get("paper_id"); action=d.get("action")
+    user=SYS.users_map.get(uid)
+    if not user: return jsonify({"error":"User not found"}),404
+    # Remove from viewed exclusion if user explicitly likes/saves
+    if action == "unlike" and pid in user.liked_papers:
+        user.liked_papers.remove(pid)
+    elif action == "unsave" and pid in user.saved_papers:
+        user.saved_papers.remove(pid)
+    else:
+        user.add_interaction(pid, action)
+    save_users(SYS.users)
+    return jsonify({
+        "ok": True,
+        "viewed": user.viewed_papers,
+        "liked":  user.liked_papers,
+        "saved":  user.saved_papers,
+    })
+
+@app.route("/api/papers/tag/<tag>", methods=["GET"])
+def api_papers_by_tag(tag):
+    """Повертає всі статті з певним тегом"""
+    tag_lower = tag.lower()
+    results = [p for p in SYS.papers if tag_lower in [k.lower() for k in p.keywords]]
+    return jsonify({"papers": [p.to_dict() for p in results], "total": len(results), "tag": tag})
+
+@app.route("/api/papers/tag/<tag>", methods=["DELETE"])
+def api_remove_tag(tag):
+    """Видаляє тег з усіх статей"""
+    tag_lower = tag.lower()
+    count = 0
+    for p in SYS.papers:
+        before = len(p.keywords)
+        p.keywords = [k for k in p.keywords if k.lower() != tag_lower]
+        if len(p.keywords) < before:
+            count += 1
+    # Refit content-based after keyword change
+    try: SYS.cb.fit(SYS.papers)
+    except Exception as e: logger.warning(f"CB refit: {e}")
+    logger.info(f"Removed tag '{tag}' from {count} papers")
+    return jsonify({"ok": True, "tag": tag, "papers_affected": count})
+
+@app.route("/api/papers")
+def api_papers():
+    page=int(request.args.get("page",1)); per=20
+    start=(page-1)*per
+    return jsonify({"papers":[p.to_dict() for p in SYS.papers[start:start+per]],
+                    "total":len(SYS.papers),"page":page,"pages":(len(SYS.papers)+per-1)//per})
+
+# ══════════════════════════════════════════════════════════════════
+#  HTML ФРОНТЕНД (вбудований)
+# ══════════════════════════════════════════════════════════════════
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SciRec — Система рекомендацій</title>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@300;400;500&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:        #f5f3ef;
+  --bg2:       #faf9f7;
+  --bg3:       #efede8;
+  --surface:   #ffffff;
+  --surface2:  #f0ede8;
+  --border:    #e2ddd6;
+  --border2:   #cdc7be;
+  --ink:       #1a1714;
+  --ink2:      #5a5248;
+  --ink3:      #9c9088;
+  --ink4:      #c8c0b8;
+  --accent:    #2563eb;
+  --accent2:   #1d4ed8;
+  --accent-bg: #eff6ff;
+  --accent-br: #bfdbfe;
+  --green:     #16a34a;
+  --green-bg:  #f0fdf4;
+  --green-br:  #bbf7d0;
+  --red:       #dc2626;
+  --red-bg:    #fef2f2;
+  --red-br:    #fecaca;
+  --amber:     #d97706;
+  --amber-bg:  #fffbeb;
+  --amber-br:  #fde68a;
+  --violet:    #7c3aed;
+  --violet-bg: #f5f3ff;
+  --violet-br: #ddd6fe;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.06), 0 1px 3px rgba(0,0,0,.1);
+  --shadow:    0 2px 4px rgba(0,0,0,.06), 0 4px 8px rgba(0,0,0,.08);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,.08), 0 12px 24px rgba(0,0,0,.1);
+  --r:  6px;
+  --r2: 10px;
+  --r3: 14px;
+  --font-head: 'Lora', Georgia, serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-body: 'Inter', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: var(--bg3); }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink4); }
+
+/* ── Layout ──────────────────────────────────────────────────────── */
+.layout { display: grid; grid-template-columns: 1fr 252px; min-height: 100vh; }
+
+/* ── Sidebar ─────────────────────────────────────────────────────── */
+.sidebar {
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh;
+  overflow-y: auto;
+  box-shadow: -2px 0 8px rgba(0,0,0,.04);
+}
+.nav { padding: 12px 12px; flex: 1; }
+.nav-section {
+  font-size: 9px; font-family: var(--font-mono); color: var(--ink3);
+  letter-spacing: .12em; text-transform: uppercase;
+  padding: 0 8px; margin: 14px 0 5px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 10px; border-radius: var(--r2);
+  cursor: pointer; transition: all .12s;
+  color: var(--ink2); font-size: 13px;
+  margin-bottom: 1px; font-weight: 400;
+  border: 1px solid transparent;
+}
+.nav-item:hover { background: var(--bg3); color: var(--ink); }
+.nav-item.active {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-color: var(--accent-br);
+  font-weight: 500;
+}
+.nav-icon { width: 16px; text-align: center; font-size: 14px; flex-shrink: 0; opacity: .7; }
+.nav-item.active .nav-icon { opacity: 1; }
+.nav-item .badge {
+  margin-left: auto;
+  background: var(--bg3); color: var(--ink3);
+  font-size: 9px; font-family: var(--font-mono);
+  padding: 1px 6px; border-radius: 20px;
+  border: 1px solid var(--border);
+}
+.nav-item.active .badge { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-br); }
+
+.sidebar-footer { padding: 14px 20px; border-top: 1px solid var(--border); }
+.status-row { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+.status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 0 2px var(--green-bg);
+  flex-shrink: 0;
+}
+.status-label { font-size: 10px; color: var(--ink3); font-family: var(--font-mono); }
+
+/* ── Main ────────────────────────────────────────────────────────── */
+.main { display: flex; flex-direction: column; background: var(--bg); }
+.topbar {
+  padding: 14px 28px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface);
+  position: sticky; top: 0; z-index: 10;
+  box-shadow: var(--shadow-sm);
+}
+.topbar-bread {
+  font-size: 10px; font-family: var(--font-mono);
+  color: var(--ink3); margin-bottom: 1px;
+}
+.topbar-title {
+  font-family: var(--font-head); font-size: 19px;
+  font-weight: 500; color: var(--ink); letter-spacing: -.2px;
+}
+.topbar-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+.content { flex: 1; padding: 28px; max-width: 1100px; }
+.page { display: none; animation: fadeIn .15s ease; }
+.page.active { display: block; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+/* ══ BUTTONS — redesigned ══════════════════════════════════════════ */
+
+/* Base */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: 6px; font-family: var(--font-body); font-size: 13px;
+  font-weight: 500; cursor: pointer; border-radius: var(--r2);
+  transition: all .12s cubic-bezier(.4,0,.2,1);
+  white-space: nowrap; letter-spacing: -.01em;
+  position: relative; overflow: hidden;
+}
+.btn::after {
+  content: ''; position: absolute; inset: 0;
+  background: transparent; border-radius: inherit;
+  transition: background .12s;
+}
+.btn:hover::after { background: rgba(0,0,0,.04); }
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+/* Sizes */
+.btn-lg  { padding: 11px 22px; font-size: 14px; border-radius: var(--r3); }
+.btn-md  { padding: 8px 16px; }
+.btn-sm  { padding: 5px 11px; font-size: 12px; border-radius: var(--r); }
+.btn-xs  { padding: 3px 8px; font-size: 11px; border-radius: 5px; }
+
+/* Variants */
+.btn-solid {
+  background: var(--accent); color: #fff;
+  border: 1px solid var(--accent2);
+  box-shadow: 0 1px 2px rgba(37,99,235,.25), 0 0 0 0 rgba(37,99,235,0);
+}
+.btn-solid:hover {
+  background: var(--accent2);
+  box-shadow: 0 2px 8px rgba(37,99,235,.35);
+}
+.btn-solid:active { background: #1e40af; }
+
+.btn-outline {
+  background: var(--surface); color: var(--ink);
+  border: 1.5px solid var(--border2);
+  box-shadow: var(--shadow-sm);
+}
+.btn-outline:hover { border-color: var(--ink3); background: var(--bg3); }
+
+.btn-ghost {
+  background: transparent; color: var(--ink2);
+  border: 1px solid transparent;
+}
+.btn-ghost:hover { background: var(--bg3); color: var(--ink); border-color: var(--border); }
+
+.btn-soft {
+  background: var(--accent-bg); color: var(--accent);
+  border: 1px solid var(--accent-br);
+}
+.btn-soft:hover { background: #dbeafe; border-color: #93c5fd; }
+
+.btn-danger {
+  background: var(--red-bg); color: var(--red);
+  border: 1px solid var(--red-br);
+}
+.btn-danger:hover { background: #fee2e2; border-color: #fca5a5; }
+
+.btn-success {
+  background: var(--green-bg); color: var(--green);
+  border: 1px solid var(--green-br);
+}
+.btn-success:hover { background: #dcfce7; }
+
+.btn-amber {
+  background: var(--amber-bg); color: var(--amber);
+  border: 1px solid var(--amber-br);
+}
+
+/* Icon buttons */
+.btn-icon {
+  width: 32px; height: 32px; padding: 0;
+  border-radius: var(--r); font-size: 14px;
+}
+.btn-icon-lg { width: 38px; height: 38px; border-radius: var(--r2); font-size: 16px; }
+
+/* ── Inputs ──────────────────────────────────────────────────────── */
+.field-input {
+  width: 100%; background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: var(--r2); padding: 9px 12px;
+  color: var(--ink); font-family: var(--font-body);
+  font-size: 13px; outline: none;
+  transition: border-color .12s, box-shadow .12s;
+  box-shadow: var(--shadow-sm);
+}
+.field-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+.field-input::placeholder { color: var(--ink4); }
+.field-label {
+  font-size: 11px; color: var(--ink2); font-weight: 500;
+  margin-bottom: 5px; display: block;
+}
+
+/* ── Search ──────────────────────────────────────────────────────── */
+.search-wrap { position: relative; }
+.search-input {
+  width: 100%; background: var(--surface);
+  border: 1.5px solid var(--border); border-radius: var(--r2);
+  padding: 11px 40px 11px 42px;
+  color: var(--ink); font-family: var(--font-body);
+  font-size: 14px; outline: none;
+  box-shadow: var(--shadow-sm);
+  transition: border-color .12s, box-shadow .12s;
+}
+.search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+.search-input::placeholder { color: var(--ink4); }
+.search-icon { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--ink3); pointer-events: none; }
+#btn-clear-search {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--ink3); cursor: pointer; font-size: 13px;
+  display: none; padding: 2px 7px; border-radius: 5px;
+  transition: all .1s;
+}
+#btn-clear-search:hover { background: var(--border); color: var(--ink); }
+
+/* ── Controls bar ────────────────────────────────────────────────── */
+.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+.ctrl-group {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r2); padding: 5px 10px;
+  box-shadow: var(--shadow-sm);
+}
+.ctrl-label { font-size: 11px; color: var(--ink3); font-family: var(--font-mono); white-space: nowrap; }
+.slider-wrap { display: flex; align-items: center; gap: 6px; }
+.slider {
+  -webkit-appearance: none; appearance: none;
+  height: 3px; background: var(--border2);
+  border-radius: 2px; outline: none; cursor: pointer; width: 90px;
+}
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 14px; height: 14px;
+  border-radius: 50%; background: var(--accent);
+  cursor: pointer; border: 2px solid white;
+  box-shadow: 0 1px 4px rgba(37,99,235,.4);
+}
+.select {
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--ink); padding: 5px 8px; border-radius: var(--r);
+  font-size: 12px; font-family: var(--font-mono); outline: none; cursor: pointer;
+}
+
+/* ── Section header ──────────────────────────────────────────────── */
+.section-hd { margin-bottom: 18px; }
+.section-title {
+  font-family: var(--font-head); font-size: 22px;
+  font-weight: 600; color: var(--ink); letter-spacing: -.3px;
+}
+.section-sub { font-size: 12px; color: var(--ink3); margin-top: 2px; }
+
+/* ── Alert ───────────────────────────────────────────────────────── */
+.alert {
+  background: var(--accent-bg); border: 1px solid var(--accent-br);
+  border-radius: var(--r2); padding: 11px 14px;
+  font-size: 13px; color: var(--accent);
+  margin-bottom: 20px; display: flex; align-items: flex-start; gap: 9px;
+}
+.alert-icon { flex-shrink: 0; margin-top: 1px; }
+
+/* ── User grid ───────────────────────────────────────────────────── */
+.user-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(195px,1fr)); gap: 10px; margin-bottom: 20px; }
+.user-card {
+  background: var(--surface); border: 1.5px solid var(--border);
+  border-radius: var(--r2); padding: 14px;
+  cursor: pointer; transition: all .12s;
+  position: relative; box-shadow: var(--shadow-sm);
+}
+.user-card:hover { border-color: var(--border2); box-shadow: var(--shadow); transform: translateY(-1px); }
+.user-card.selected {
+  border-color: var(--accent); background: var(--accent-bg);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.1);
+}
+.user-card.selected::after {
+  content: '✓'; position: absolute; top: 9px; right: 11px;
+  color: var(--accent); font-size: 11px; font-weight: 600;
+}
+.user-name { font-family: var(--font-head); font-size: 14px; font-weight: 500; color: var(--ink); margin-bottom: 1px; }
+.user-inst { font-size: 10px; color: var(--ink3); margin-bottom: 8px; font-family: var(--font-mono); }
+.tag {
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--ink2); font-size: 10px; padding: 2px 7px;
+  border-radius: 20px; font-family: var(--font-mono);
+  display: inline-block;
+}
+.tag.accent { background: var(--accent-bg); border-color: var(--accent-br); color: var(--accent); }
+.tag.green  { background: var(--green-bg); border-color: var(--green-br); color: var(--green); }
+.tag.amber  { background: var(--amber-bg); border-color: var(--amber-br); color: var(--amber); }
+
+/* ── Paper cards ─────────────────────────────────────────────────── */
+.papers-list { display: flex; flex-direction: column; gap: 8px; }
+.paper-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r2); padding: 16px 18px;
+  transition: all .12s; box-shadow: var(--shadow-sm);
+}
+.paper-card:hover { border-color: var(--border2); box-shadow: var(--shadow); }
+.paper-card.expanded { border-color: var(--accent-br); }
+.paper-rank-badge {
+  flex-shrink: 0; width: 24px; height: 24px;
+  border-radius: 6px; background: var(--accent-bg);
+  border: 1px solid var(--accent-br);
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono); font-size: 10px; font-weight: 500; color: var(--accent);
+}
+.paper-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 7px; }
+.paper-title {
+  font-family: var(--font-head); font-size: 15px; font-weight: 500;
+  color: var(--ink); line-height: 1.35; flex: 1; cursor: pointer;
+}
+.paper-title:hover { color: var(--accent); }
+.paper-meta { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-bottom: 9px; }
+.meta-chip {
+  font-size: 10px; font-family: var(--font-mono);
+  padding: 2px 8px; border-radius: 20px; border: 1px solid;
+}
+.chip-venue  { background: var(--violet-bg); border-color: var(--violet-br); color: var(--violet); }
+.chip-year   { background: var(--amber-bg);  border-color: var(--amber-br);  color: var(--amber);  }
+.chip-oa     { background: var(--green-bg);  border-color: var(--green-br);  color: var(--green);  }
+.chip-cite   { background: var(--bg3); border-color: var(--border); color: var(--ink3); }
+.viewed-chip { background: var(--accent-bg); border-color: var(--accent-br); color: var(--accent); }
+.paper-score { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+.score-label { font-size: 9px; color: var(--ink3); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
+.score-bar-wrap { flex: 1; max-width: 130px; height: 4px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+.score-bar-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg,#3b82f6,#2563eb); transition: width .5s ease; }
+.score-val { font-size: 10px; color: var(--accent); font-family: var(--font-mono); font-weight: 500; min-width: 36px; }
+.paper-keywords { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.paper-abstract {
+  font-size: 12.5px; color: var(--ink2); line-height: 1.65;
+  display: none; margin-top: 10px; padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.paper-card.expanded .paper-abstract { display: block; }
+.paper-models { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
+.model-badge { font-size: 9px; font-family: var(--font-mono); padding: 2px 7px; border-radius: 20px; font-weight: 500; }
+.mb-cb { background: #eff6ff; border: 1px solid #bfdbfe; color: #1d4ed8; }
+.mb-cf { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; }
+.mb-kg { background: #fffbeb; border: 1px solid #fde68a; color: #b45309; }
+.paper-reason { font-size: 11px; color: var(--ink3); font-style: italic; margin-top: 4px; }
+
+/* ── Action buttons on cards ─────────────────────────────────────── */
+.action-bar {
+  display: flex; gap: 5px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.act-btn {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border-radius: 20px;
+  font-size: 11px; font-family: var(--font-mono); font-weight: 500;
+  cursor: pointer; transition: all .12s;
+  border: 1.5px solid var(--border);
+  background: var(--bg3); color: var(--ink2);
+}
+.act-btn:hover { background: var(--surface2); color: var(--ink); border-color: var(--border2); }
+.act-btn.liked { background: var(--red-bg); border-color: var(--red-br); color: var(--red); }
+.act-btn.saved { background: var(--green-bg); border-color: var(--green-br); color: var(--green); }
+
+/* ── Meta bar ────────────────────────────────────────────────────── */
+.meta-bar {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r2); padding: 12px 16px;
+  margin-bottom: 18px; box-shadow: var(--shadow-sm);
+}
+.meta-row { display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 11px; align-items: center; }
+.meta-item { color: var(--ink3); }
+.meta-item b { color: var(--ink); font-weight: 600; }
+.weight-viz { display: flex; align-items: center; gap: 3px; margin-top: 8px; height: 6px; border-radius: 3px; overflow: hidden; width: 180px; }
+.weight-seg { height: 100%; transition: width .3s; }
+
+/* ── Stats ───────────────────────────────────────────────────────── */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(120px,1fr)); gap: 10px; margin-bottom: 20px; }
+.stat-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r2); padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+}
+.stat-val { font-family: var(--font-head); font-size: 28px; font-weight: 600; color: var(--accent); }
+.stat-label { font-size: 10px; color: var(--ink3); margin-top: 2px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
+
+/* ── Architecture ────────────────────────────────────────────────── */
+.arch-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-bottom: 14px; }
+.arch-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r2); padding: 16px; position: relative;
+  overflow: hidden; box-shadow: var(--shadow-sm);
+}
+.arch-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+.arch-card.cb::before   { background: #3b82f6; }
+.arch-card.cf::before   { background: #16a34a; }
+.arch-card.kg::before   { background: #d97706; }
+.arch-card.hybrid::before { background: linear-gradient(90deg,#7c3aed,#2563eb); }
+.arch-title { font-family: var(--font-head); font-size: 14px; font-weight: 500; margin-bottom: 2px; color: var(--ink); }
+.arch-model { font-size: 10px; color: var(--accent); font-family: var(--font-mono); margin-bottom: 10px; }
+.arch-detail { font-size: 11px; color: var(--ink3); line-height: 1.7; }
+.arch-detail span { color: var(--ink2); }
+
+/* ── Flow ────────────────────────────────────────────────────────── */
+.flow { display: flex; align-items: center; gap: 0; margin: 16px 0; overflow-x: auto; padding: 4px 0; }
+.flow-node {
+  flex-shrink: 0; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 6px 12px;
+  font-size: 10px; font-family: var(--font-mono); color: var(--ink2);
+  white-space: nowrap; box-shadow: var(--shadow-sm);
+}
+.flow-node.hl { background: var(--accent-bg); border-color: var(--accent-br); color: var(--accent); font-weight: 500; }
+.flow-arrow { flex-shrink: 0; color: var(--ink4); padding: 0 5px; font-size: 12px; }
+
+/* ── Weight rows ─────────────────────────────────────────────────── */
+.wt-row {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+  padding: 10px 14px; background: var(--bg3);
+  border-radius: var(--r); border: 1px solid var(--border);
+}
+.wt-name { font-size: 11px; font-family: var(--font-mono); color: var(--ink2); width: 130px; flex-shrink: 0; }
+.wt-bar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.wt-fill { height: 100%; border-radius: 3px; transition: width .3s; }
+.wt-pct { font-size: 11px; font-family: var(--font-mono); color: var(--ink); font-weight: 600; min-width: 32px; text-align: right; }
+
+/* ── Tabs ────────────────────────────────────────────────────────── */
+.tabs {
+  display: flex; gap: 2px; margin-bottom: 18px;
+  background: var(--bg3); padding: 3px;
+  border-radius: var(--r2); border: 1px solid var(--border);
+  width: fit-content;
+}
+.tab-btn {
+  background: transparent; border: none; color: var(--ink3);
+  padding: 6px 14px; border-radius: var(--r);
+  cursor: pointer; font-size: 12px; font-family: var(--font-body);
+  font-weight: 500; transition: all .12s; white-space: nowrap;
+}
+.tab-btn:hover { color: var(--ink); background: var(--surface); }
+.tab-btn.active {
+  background: var(--surface); color: var(--accent);
+  box-shadow: var(--shadow-sm); border: 1px solid var(--border);
+}
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* ── Form ────────────────────────────────────────────────────────── */
+.form-card {
+  background: var(--surface); border: 1.5px solid var(--accent-br);
+  border-radius: var(--r3); padding: 22px;
+  margin-bottom: 20px; box-shadow: var(--shadow);
+}
+.form-card-title { font-family: var(--font-head); font-size: 17px; font-weight: 500; margin-bottom: 18px; color: var(--ink); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+.form-field { display: flex; flex-direction: column; }
+.interests-preview { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 4px; min-height: 20px; }
+.form-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.form-error { font-size: 11px; color: var(--red); font-family: var(--font-mono); display: none; }
+
+/* ── Modal ───────────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.4);
+  z-index: 1000; display: none; align-items: center; justify-content: center;
+  backdrop-filter: blur(3px);
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r3); width: min(500px,94vw);
+  overflow: hidden; box-shadow: var(--shadow-lg);
+}
+.modal-head {
+  padding: 18px 22px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg2);
+}
+.modal-title { font-family: var(--font-head); font-size: 17px; font-weight: 500; color: var(--ink); }
+.modal-close {
+  background: var(--bg3); border: 1px solid var(--border);
+  color: var(--ink3); font-size: 16px; cursor: pointer;
+  padding: 4px 8px; border-radius: var(--r); line-height: 1;
+  transition: all .1s;
+}
+.modal-close:hover { background: var(--border); color: var(--ink); }
+.modal-body { padding: 22px; }
+
+/* ── Loader / Empty ──────────────────────────────────────────────── */
+.empty { text-align: center; padding: 50px; color: var(--ink3); }
+.empty-icon { font-size: 32px; margin-bottom: 10px; opacity: .5; }
+.loader { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 50px; gap: 14px; }
+.spinner { width: 26px; height: 26px; border: 2.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .65s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loader-text { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); }
+
+/* ── Catalog toolbar ─────────────────────────────────────────────── */
+.catalog-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+.catalog-info { font-size: 12px; color: var(--ink3); font-family: var(--font-mono); }
+.catalog-info b { color: var(--ink); }
+.toolbar-right { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.tag-strip { display: flex; align-items: center; gap: 5px; }
+.pager { display: flex; align-items: center; gap: 4px; }
+.pager-info { font-size: 11px; color: var(--ink3); font-family: var(--font-mono); padding: 0 5px; }
+
+/* ── User list ───────────────────────────────────────────────────── */
+.user-list-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r2); padding: 16px 18px;
+  margin-bottom: 8px; box-shadow: var(--shadow-sm);
+  transition: box-shadow .12s;
+}
+.user-list-card:hover { box-shadow: var(--shadow); }
+.user-list-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 9px; }
+.user-list-name { font-family: var(--font-head); font-size: 16px; font-weight: 500; color: var(--ink); }
+.user-list-id { font-size: 10px; color: var(--ink3); font-family: var(--font-mono); margin-top: 1px; }
+.user-stats { display: flex; gap: 12px; font-size: 11px; font-family: var(--font-mono); color: var(--ink3); align-items: center; }
+.user-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+
+/* ── Compare ─────────────────────────────────────────────────────── */
+.cmp-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap: 12px; }
+.cmp-col { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r2); overflow: hidden; box-shadow: var(--shadow-sm); }
+.cmp-head { padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+.cmp-head-label { font-size: 12px; font-weight: 500; }
+.cmp-head-count { font-size: 10px; color: var(--ink3); margin-top: 1px; font-family: var(--font-mono); }
+.cmp-body { padding: 10px; }
+.cmp-item { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: flex-start; }
+.cmp-num { flex-shrink: 0; width: 20px; height: 20px; border-radius: 5px; background: var(--bg3); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 9px; font-family: var(--font-mono); font-weight: 600; color: var(--ink3); }
+.cmp-text { font-size: 12px; color: var(--ink); line-height: 1.35; }
+.cmp-meta { font-size: 10px; color: var(--ink3); font-family: var(--font-mono); margin-top: 2px; }
+
+/* ── Similar modal ───────────────────────────────────────────────── */
+.sim-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 1000; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(3px); }
+.sim-box { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r3); width: min(680px,96vw); max-height: 82vh; overflow: hidden; display: flex; flex-direction: column; box-shadow: var(--shadow-lg); }
+.sim-head { padding: 16px 22px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; background: var(--bg2); }
+.sim-body { overflow-y: auto; padding: 16px 22px; }
+
+/* ── Flash ───────────────────────────────────────────────────────── */
+.flash { position: fixed; bottom: 22px; right: 22px; border: 1px solid; border-radius: var(--r2); padding: 11px 16px; font-size: 12px; font-family: var(--font-body); font-weight: 500; z-index: 9999; animation: slideUp .2s ease; max-width: 340px; box-shadow: var(--shadow-lg); }
+.flash.green { background: var(--green-bg); border-color: var(--green-br); color: var(--green); }
+.flash.red   { background: var(--red-bg);   border-color: var(--red-br);   color: var(--red);   }
+.flash.blue  { background: var(--accent-bg); border-color: var(--accent-br); color: var(--accent); }
+@keyframes slideUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* ── Tag result ──────────────────────────────────────────────────── */
+#tag-result { padding: 12px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r2); box-shadow: var(--shadow-sm); }
+
+/* ── My papers header ────────────────────────────────────────────── */
+.my-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; flex-wrap: wrap; gap: 10px; }
+
+/* ── Responsive ──────────────────────────────────────────────────── */
+@media(max-width:768px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { height: auto; position: relative; }
+  .arch-grid { grid-template-columns: 1fr; }
+  .form-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- ── SIDEBAR ──────────────────────────────────────────────────── -->
+<!-- ── MAIN ─────────────────────────────────────────────────────── -->
+<main class="main">
+  <div class="topbar">
+    <div>
+      <div class="topbar-bread">SciRec / <span id="topbar-page">recommend</span></div>
+      <div class="topbar-title" id="topbar-title">Рекомендації</div>
+    </div>
+    <div class="topbar-actions">
+      <span id="topbar-latency" style="font-size:11px;color:var(--ink3);font-family:var(--font-mono)"></span>
+    </div>
+  </div>
+
+  <div class="content" id="content">
+
+    <!-- RECOMMEND -->
+    <div class="page active" id="page-recommend">
+      <div class="alert">
+        <span class="alert-icon">✦</span>
+        <span>Оберіть профіль дослідника та налаштуйте параметри — система об'єднає три ML-моделі через гібридний ансамбль</span>
+      </div>
+      <div class="section-hd"><div class="section-title">Профіль дослідника</div></div>
+      <div class="user-grid" id="user-grid"></div>
+      <div class="controls">
+        <div class="ctrl-group">
+          <span class="ctrl-label">Топ-K</span>
+          <select class="select" id="top-k">
+            <option value="5">5</option><option value="10" selected>10</option>
+            <option value="15">15</option><option value="20">20</option>
+          </select>
+        </div>
+        <div class="ctrl-group">
+          <span class="ctrl-label">Різноманітність λ</span>
+          <div class="slider-wrap">
+            <span style="font-size:9px;color:var(--ink4);font-family:var(--font-mono)">rel.</span>
+            <input type="range" class="slider" id="diversity-slider" min="0" max="1" step="0.05" value="0.3">
+            <span style="font-size:9px;color:var(--ink4);font-family:var(--font-mono)">div.</span>
+          </div>
+          <span id="div-val" style="font-size:11px;color:var(--accent);font-family:var(--font-mono);font-weight:600;min-width:24px">0.3</span>
+        </div>
+        <button class="btn btn-solid btn-md" id="btn-recommend">✦ Отримати рекомендації</button>
+      </div>
+      <div id="rec-meta" style="display:none" class="meta-bar">
+        <div class="meta-row">
+          <span class="meta-item">Кандидати <b id="m-total">—</b></span>
+          <span class="meta-item">CB <b id="m-cb" style="color:#1d4ed8">—</b></span>
+          <span class="meta-item">CF <b id="m-cf" style="color:#15803d">—</b></span>
+          <span class="meta-item">KG <b id="m-kg" style="color:#b45309">—</b></span>
+          <span class="meta-item">Латентність <b id="m-lat">—</b> мс</span>
+          <span class="meta-item">λ = <b id="m-lam">—</b></span>
+        </div>
+        <div class="weight-viz" id="weight-viz"></div>
+      </div>
+      <div id="rec-results"></div>
+    </div>
+
+    <!-- CATALOG -->
+    <div class="page" id="page-catalog">
+      <div class="search-wrap" style="margin-bottom:14px">
+        <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <input class="search-input" id="search-input" placeholder="Пошук за назвою, ключовими словами, авторами…" autocomplete="off">
+        <button id="btn-clear-search">×</button>
+      </div>
+      <div class="catalog-toolbar">
+        <div class="catalog-info" id="catalog-status"></div>
+        <div class="toolbar-right">
+          <div class="tag-strip">
+            <input id="tag-input" type="text" placeholder="тег…" class="field-input" style="width:110px;padding:5px 9px;font-size:11px">
+            <button class="btn btn-outline btn-sm" id="btn-find-tag">🔍 Знайти</button>
+            <button class="btn btn-danger btn-sm" id="btn-delete-tag">✕ Тег</button>
+          </div>
+          <div class="pager">
+            <button class="btn btn-outline btn-sm btn-icon" id="btn-prev">‹</button>
+            <span class="pager-info" id="browse-info"></span>
+            <button class="btn btn-outline btn-sm btn-icon" id="btn-next">›</button>
+          </div>
+        </div>
+      </div>
+      <div id="tag-result" style="display:none;margin-bottom:14px"></div>
+      <div id="search-results" style="display:none"></div>
+      <div id="browse-results"></div>
+    </div>
+
+    <!-- MY PAPERS -->
+    <div class="page" id="page-mypapers">
+      <div class="my-header">
+        <div class="section-title">Мої статті</div>
+        <div class="section-sub" id="mypapers-user-label">Оберіть профіль на сторінці рекомендацій</div>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="viewed">👁 Прочитані <span id="cnt-viewed">0</span></button>
+        <button class="tab-btn" data-tab="liked">♥ Лайкнуті <span id="cnt-liked">0</span></button>
+        <button class="tab-btn" data-tab="saved">🔖 Збережені <span id="cnt-saved">0</span></button>
+      </div>
+      <div id="mypapers-viewed" class="tab-content active"></div>
+      <div id="mypapers-liked"  class="tab-content"></div>
+      <div id="mypapers-saved"  class="tab-content"></div>
+    </div>
+
+    <!-- USERS -->
+    <div class="page" id="page-users">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px">
+        <div class="section-title">Профілі</div>
+        <button class="btn btn-solid btn-md" id="btn-show-add-user">+ Додати профіль</button>
+      </div>
+      <div id="add-user-form" style="display:none" class="form-card">
+        <div class="form-card-title">Новий дослідник</div>
+        <div class="form-grid">
+          <div class="form-field"><label class="field-label">Ім'я *</label><input id="new-name" type="text" placeholder="Прізвище Ім'я" class="field-input"></div>
+          <div class="form-field"><label class="field-label">Установа</label><input id="new-inst" type="text" placeholder="Університет / Інститут" class="field-input"></div>
+        </div>
+        <div class="form-field" style="margin-bottom:16px">
+          <label class="field-label">Наукові інтереси * <span style="color:var(--ink3);font-weight:400">(через кому)</span></label>
+          <input id="new-interests" type="text" placeholder="machine learning, NLP, computer vision" class="field-input">
+          <div class="interests-preview" id="interests-preview"></div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-solid btn-md" id="btn-save-user">Зберегти</button>
+          <button class="btn btn-ghost btn-md" id="btn-cancel-user">Скасувати</button>
+          <span class="form-error" id="add-user-error"></span>
+        </div>
+      </div>
+      <div id="users-list"></div>
+    </div>
+
+    <!-- ARCHITECTURE -->
+    <div class="page" id="page-architecture">
+      <div class="section-hd">
+        <div class="section-title">Архітектура</div>
+        <div class="section-sub">Мікросервісна система рекомендацій з інтеграцією ML-моделей</div>
+      </div>
+      <div class="flow">
+        <div class="flow-node">Browser</div><div class="flow-arrow">→</div>
+        <div class="flow-node hl">Flask API Gateway</div><div class="flow-arrow">→</div>
+        <div class="flow-node">Content-Based</div><div class="flow-arrow">+</div>
+        <div class="flow-node">Collaborative</div><div class="flow-arrow">+</div>
+        <div class="flow-node">Knowledge Graph</div><div class="flow-arrow">→</div>
+        <div class="flow-node hl">Hybrid + MMR</div><div class="flow-arrow">→</div>
+        <div class="flow-node">Top-K</div>
+      </div>
+      <div class="arch-grid" id="arch-grid">
+        <div class="arch-card cb">
+          <div class="arch-title">📄 Content-Based</div>
+          <div class="arch-model" id="arch-cb-model">TF-IDF + Cosine Similarity</div>
+          <div class="arch-detail">Vocab: <span id="arch-cb-vocab">—</span><br>Статей: <span id="arch-cb-papers">—</span><br>ngram (1,2), sublinear_tf</div>
+        </div>
+        <div class="arch-card cf">
+          <div class="arch-title">👥 Collaborative</div>
+          <div class="arch-model" id="arch-cf-model">SVD Matrix Factorization</div>
+          <div class="arch-detail">Матриця: <span id="arch-cf-matrix">—</span><br>Дисперсія: <span id="arch-cf-var">—</span><br>view=1 · like=3 · save=5</div>
+        </div>
+        <div class="arch-card kg">
+          <div class="arch-title">🔗 Knowledge Graph</div>
+          <div class="arch-model" id="arch-kg-model">PageRank d=0.85</div>
+          <div class="arch-detail">Вузли: <span id="arch-kg-nodes">—</span> / Ребра: <span id="arch-kg-edges">—</span><br>Ключових слів: <span id="arch-kg-kw">—</span></div>
+        </div>
+      </div>
+      <div class="arch-card hybrid" style="margin-bottom:16px">
+        <div class="arch-title">⚡ Hybrid Ensemble + MMR</div>
+        <div class="arch-model">Weighted Fusion + Maximal Marginal Relevance</div>
+        <div style="font-size:12px;color:var(--ink3);margin-bottom:14px;font-family:var(--font-mono)">MMR = λ·rel(d) − (1−λ)·max sim(d, Selected)</div>
+        <div id="weight-rows"></div>
+      </div>
+      <div class="stats-grid" id="arch-stats"></div>
+    </div>
+
+    <!-- COMPARE -->
+    <div class="page" id="page-compare">
+      <div class="section-hd"><div class="section-title">Порівняння моделей</div></div>
+      <div class="alert"><span class="alert-icon">◈</span><span>Оберіть профіль для side-by-side порівняння чотирьох ML-підходів</span></div>
+      <div class="user-grid" id="compare-user-grid"></div>
+      <button class="btn btn-solid btn-md" id="btn-compare" style="margin-bottom:20px">⊞ Порівняти моделі</button>
+      <div id="compare-results"></div>
+    </div>
+
+  </div>
+</main>
+<aside class="sidebar">
+  
+  <nav class="nav">
+    <div class="nav-section">Основне</div>
+    <div class="nav-item active" data-page="recommend">
+      <span class="nav-icon">✦</span> Рекомендації
+    </div>
+    <div class="nav-item" data-page="catalog">
+      <span class="nav-icon">◎</span> Статті <span class="badge" id="badge-catalog">200</span>
+    </div>
+    <div class="nav-item" data-page="mypapers">
+      <span class="nav-icon">♥</span> Мої статті <span class="badge" id="badge-liked">0</span>
+    </div>
+    <div class="nav-item" data-page="users">
+      <span class="nav-icon">◈</span> Профілі
+    </div>
+    <div class="nav-section">Система</div>
+    <div class="nav-item" data-page="architecture">
+      <span class="nav-icon">⬡</span> Архітектура
+    </div>
+    <div class="nav-item" data-page="compare">
+      <span class="nav-icon">⊞</span> Порівняння ML
+    </div>
+  </nav>
+  <div class="sidebar-footer" id="sidebar-status">
+    <div class="status-row"><div class="status-dot" id="dot-cb"></div><div class="status-label" id="lbl-cb">ContentBased</div></div>
+    <div class="status-row"><div class="status-dot" id="dot-cf"></div><div class="status-label" id="lbl-cf">Collaborative</div></div>
+    <div class="status-row"><div class="status-dot" id="dot-kg"></div><div class="status-label" id="lbl-kg">KnowledgeGraph</div></div>
+    <div class="status-row" style="margin-top:5px"><div class="status-dot" id="dot-hybrid"></div><div class="status-label" id="lbl-hybrid">HybridEnsemble</div></div>
+  </div>
+</aside>
+
+</div>
+
+<!-- EDIT MODAL -->
+<div id="edit-modal" class="modal-overlay">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div class="modal-title">Редагування профілю</div>
+      <button id="btn-close-edit" class="modal-close">×</button>
+    </div>
+    <div class="modal-body">
+      <input id="edit-uid" type="hidden">
+      <div class="form-grid" style="margin-bottom:12px">
+        <div class="form-field"><label class="field-label">Ім'я *</label><input id="edit-name" type="text" class="field-input"></div>
+        <div class="form-field"><label class="field-label">Установа</label><input id="edit-inst" type="text" class="field-input"></div>
+      </div>
+      <div class="form-field" style="margin-bottom:18px">
+        <label class="field-label">Інтереси * (через кому)</label>
+        <input id="edit-interests" type="text" class="field-input">
+        <div class="interests-preview" id="edit-interests-preview"></div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-solid btn-md" id="btn-save-edit">Зберегти зміни</button>
+        <button class="btn btn-ghost btn-md" id="btn-close-edit2">Скасувати</button>
+        <span class="form-error" id="edit-error"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const S={page:'recommend',user:null,compareUser:null,browsePage:1,users:[],userState:{viewed:[],liked:[],saved:[]}};
+const PAGES={recommend:'Рекомендації',catalog:'Статті',mypapers:'Мої статті',users:'Профілі',architecture:'Архітектура',compare:'Порівняння ML'};
+
+document.querySelectorAll('.nav-item').forEach(el=>{
+  el.addEventListener('click',()=>{
+    const pg=el.dataset.page;
+    document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active'));
+    el.classList.add('active');
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    document.getElementById('page-'+pg).classList.add('active');
+    document.getElementById('topbar-title').textContent=PAGES[pg]||pg;
+    document.getElementById('topbar-page').textContent=pg;
+    S.page=pg;
+    if(pg==='architecture')loadArchitecture();
+    if(pg==='catalog')loadBrowse();
+    if(pg==='users')loadUsers();
+    if(pg==='compare')loadCompareUsers();
+    if(pg==='mypapers')loadMyPapers();
+  });
+});
+
+const api=url=>fetch(url).then(r=>r.json());
+const showFlash=(msg,type='green')=>{
+  const f=document.createElement('div');
+  f.className=`flash ${type}`;
+  f.textContent=(type==='green'?'✓ ':type==='red'?'✕ ':'◈ ')+msg;
+  document.body.appendChild(f);
+  setTimeout(()=>f.remove(),3000);
+};
+
+async function loadStatus(){
+  try{
+    await api('/api/status');
+    ['cb','cf','kg','hybrid'].forEach(d=>{const dot=document.getElementById('dot-'+d);if(dot)dot.style.background='var(--green)';});
+  }catch(e){}
+}
+
+async function loadUserGrid(containerId,stateKey){
+  const users=await api('/api/users');
+  S.users=users;
+  const grid=document.getElementById(containerId);
+  grid.innerHTML='';
+  users.forEach(u=>{
+    const div=document.createElement('div');
+    div.className='user-card'+(S[stateKey]===u.user_id?' selected':'');
+    div.dataset.uid=u.user_id;
+    div.innerHTML=
+      `<div class="user-name">${u.name}</div>`+
+      `<div class="user-inst">${u.user_id} · ${u.institution.split(' ').slice(0,3).join(' ')}</div>`+
+      `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:7px">${u.research_interests.slice(0,3).map(i=>`<span class="tag">${i}</span>`).join('')}</div>`+
+      `<div style="font-size:10px;color:var(--ink3);font-family:var(--font-mono)">👁 ${u.viewed} · ♥ ${u.liked} · 🔖 ${u.saved}</div>`;
+    div.addEventListener('click',async()=>{
+      S[stateKey]=u.user_id;
+      document.querySelectorAll('#'+containerId+' .user-card').forEach(c=>c.classList.remove('selected'));
+      div.classList.add('selected');
+      if(stateKey==='user')await loadUserState(u.user_id);
+    });
+    grid.appendChild(div);
+  });
+}
+
+loadUserGrid('user-grid','user');
+document.getElementById('diversity-slider').addEventListener('input',function(){document.getElementById('div-val').textContent=this.value;});
+document.getElementById('btn-recommend').addEventListener('click',async()=>{
+  if(!S.user){showFlash('Оберіть профіль','red');return;}
+  const topK=document.getElementById('top-k').value;
+  const div=document.getElementById('diversity-slider').value;
+  const res=document.getElementById('rec-results');
+  const meta=document.getElementById('rec-meta');
+  res.innerHTML='<div class="loader"><div class="spinner"></div><div class="loader-text">Запит до мікросервісів…</div></div>';
+  meta.style.display='none';
+  const data=await api(`/api/recommend/${S.user}?top_k=${topK}&diversity=${div}`);
+  if(data.error){res.innerHTML=`<div class="empty"><div class="empty-icon">⚠</div>${data.error}</div>`;return;}
+  const m=data.metadata;
+  document.getElementById('m-total').textContent=m.total;
+  document.getElementById('m-cb').textContent=m.cb;
+  document.getElementById('m-cf').textContent=m.cf;
+  document.getElementById('m-kg').textContent=m.kg;
+  document.getElementById('m-lat').textContent=m.latency_ms;
+  document.getElementById('m-lam').textContent=m.lambda;
+  document.getElementById('topbar-latency').textContent=m.latency_ms+'ms';
+  const wviz=document.getElementById('weight-viz');
+  const wc={'content_based':'#3b82f6','collaborative':'#16a34a','knowledge_graph':'#d97706'};
+  wviz.innerHTML=Object.entries(m.weights).map(([k,v])=>`<div class="weight-seg" style="width:${v*100}%;background:${wc[k]||'#94a3b8'}"></div>`).join('');
+  meta.style.display='block';
+  res.innerHTML='';
+  const list=document.createElement('div');list.className='papers-list';
+  data.recommendations.forEach(rec=>list.appendChild(makePaperCard(rec,true)));
+  res.appendChild(list);
+});
+
+let searchTimer=null;
+document.getElementById('search-input').addEventListener('input',function(){
+  const q=this.value.trim();
+  document.getElementById('btn-clear-search').style.display=q?'block':'none';
+  clearTimeout(searchTimer);
+  if(!q){
+    document.getElementById('search-results').style.display='none';
+    document.getElementById('browse-results').style.display='block';
+    document.getElementById('catalog-status').innerHTML='';
+    return;
+  }
+  searchTimer=setTimeout(()=>doSearch(q),280);
+});
+document.getElementById('btn-clear-search').addEventListener('click',()=>{
+  document.getElementById('search-input').value='';
+  document.getElementById('btn-clear-search').style.display='none';
+  document.getElementById('search-results').style.display='none';
+  document.getElementById('browse-results').style.display='block';
+  document.getElementById('catalog-status').innerHTML='';
+});
+async function doSearch(q){
+  const sr=document.getElementById('search-results');
+  const br=document.getElementById('browse-results');
+  sr.style.display='block';br.style.display='none';
+  sr.innerHTML='<div class="loader"><div class="spinner"></div><div class="loader-text">Пошук…</div></div>';
+  const data=await api('/api/search?q='+encodeURIComponent(q));
+  document.getElementById('catalog-status').innerHTML=`Знайдено <b style="color:var(--accent)">${data.length}</b> за запитом <b>"${q}"</b>`;
+  sr.innerHTML='';
+  if(!data.length){sr.innerHTML='<div class="empty"><div class="empty-icon">◎</div><div>Нічого не знайдено</div></div>';return;}
+  const list=document.createElement('div');list.className='papers-list';
+  data.forEach((r,i)=>list.appendChild(makePaperCard({rank:i+1,score:Math.min(r.relevance/20,1),models:[],reasons:[],paper:r.paper},false)));
+  sr.appendChild(list);
+}
+async function loadBrowse(){
+  document.getElementById('search-input').value='';
+  document.getElementById('btn-clear-search').style.display='none';
+  document.getElementById('search-results').style.display='none';
+  document.getElementById('browse-results').style.display='block';
+  const br=document.getElementById('browse-results');
+  br.innerHTML='<div class="loader"><div class="spinner"></div><div class="loader-text">Завантаження…</div></div>';
+  const data=await api('/api/papers?page='+S.browsePage);
+  const badge=document.getElementById('badge-catalog');
+  if(badge)badge.textContent=data.total;
+  document.getElementById('browse-info').textContent=data.page+' / '+data.pages;
+  document.getElementById('catalog-status').innerHTML=`Всього <b style="color:var(--accent)">${data.total}</b> статей`;
+  const list=document.createElement('div');list.className='papers-list';
+  data.papers.forEach((p,i)=>list.appendChild(makePaperCard({rank:(S.browsePage-1)*20+i+1,score:0,models:[],reasons:[],paper:p},false)));
+  br.innerHTML='';br.appendChild(list);
+  document.getElementById('btn-prev').disabled=S.browsePage<=1;
+  document.getElementById('btn-next').disabled=S.browsePage>=data.pages;
+}
+document.getElementById('btn-prev').addEventListener('click',()=>{if(S.browsePage>1){S.browsePage--;loadBrowse();}});
+document.getElementById('btn-next').addEventListener('click',()=>{S.browsePage++;loadBrowse();});
+
+document.getElementById('tag-input').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('btn-find-tag').click();});
+document.getElementById('btn-find-tag').addEventListener('click',async()=>{
+  const tag=document.getElementById('tag-input').value.trim();
+  if(!tag)return;
+  const el=document.getElementById('tag-result');
+  el.style.display='block';
+  el.innerHTML='<div class="loader" style="padding:12px"><div class="spinner"></div></div>';
+  const data=await api('/api/papers/tag/'+encodeURIComponent(tag));
+  if(!data.papers.length){el.innerHTML=`<div style="font-size:12px;color:var(--ink3)">Статей з тегом <b>"${tag}"</b> не знайдено</div>`;return;}
+  el.innerHTML=`<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+    <span style="font-size:12px;color:var(--ink)">Знайдено <b style="color:var(--accent)">${data.total}</b> статей з тегом <b>"${tag}"</b></span>
+    <button class="btn btn-danger btn-sm" id="btn-confirm-delete">✕ Видалити тег з усіх</button>
+  </div><div class="papers-list" id="tag-papers-list"></div>`;
+  const list=document.getElementById('tag-papers-list');
+  data.papers.slice(0,5).forEach((p,i)=>list.appendChild(makePaperCard({rank:i+1,score:0,models:[],reasons:[],paper:p},false)));
+  document.getElementById('btn-confirm-delete').addEventListener('click',async()=>{
+    if(!confirm(`Видалити тег "${tag}" з ${data.total} статей?`))return;
+    const r=await fetch('/api/papers/tag/'+encodeURIComponent(tag),{method:'DELETE'});
+    const res=await r.json();
+    el.innerHTML=`<div style="font-size:12px;color:var(--green)">✓ Тег "${tag}" видалено з ${res.papers_affected} статей</div>`;
+    document.getElementById('tag-input').value='';
+    showFlash(`Тег "${tag}" видалено`,'green');
+    loadBrowse();
+  });
+});
+document.getElementById('btn-delete-tag').addEventListener('click',()=>{
+  const tag=document.getElementById('tag-input').value.trim();
+  if(!tag){document.getElementById('tag-input').focus();return;}
+  document.getElementById('btn-find-tag').click();
+});
+
+async function loadMyPapers(){
+  if(!S.user){
+    ['viewed','liked','saved'].forEach(t=>{document.getElementById('mypapers-'+t).innerHTML='<div class="empty"><div class="empty-icon">◈</div><div>Оберіть профіль на сторінці рекомендацій</div></div>';});
+    return;
+  }
+  const user=S.users.find(u=>u.user_id===S.user);
+  if(user)document.getElementById('mypapers-user-label').textContent=user.name+' · '+user.institution;
+  ['viewed','liked','saved'].forEach(t=>{document.getElementById('mypapers-'+t).innerHTML='<div class="loader"><div class="spinner"></div></div>';});
+  const data=await api('/api/users/'+S.user+'/history');
+  S.userState.viewed=(data.viewed||[]).map(p=>p.id);
+  S.userState.liked=(data.liked||[]).map(p=>p.id);
+  S.userState.saved=(data.saved||[]).map(p=>p.id);
+  updateLikedBadge();
+  document.getElementById('cnt-viewed').textContent=data.viewed.length;
+  document.getElementById('cnt-liked').textContent=data.liked.length;
+  document.getElementById('cnt-saved').textContent=data.saved.length;
+  const renderTab=(tabId,papers)=>{
+    const el=document.getElementById('mypapers-'+tabId);
+    el.innerHTML='';
+    if(!papers.length){el.innerHTML='<div class="empty"><div class="empty-icon">'+(tabId==='viewed'?'👁':tabId==='liked'?'♥':'🔖')+'</div><div>Поки немає статей</div></div>';return;}
+    const list=document.createElement('div');list.className='papers-list';
+    papers.forEach((p,i)=>list.appendChild(makePaperCard({rank:i+1,score:0,models:[],reasons:[],paper:p},false)));
+    el.appendChild(list);
+  };
+  renderTab('viewed',data.viewed);renderTab('liked',data.liked);renderTab('saved',data.saved);
+}
+document.querySelectorAll('.tab-btn').forEach(btn=>{
+  btn.addEventListener('click',function(){
+    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+    this.classList.add('active');
+    const tab=this.dataset.tab;
+    document.querySelectorAll('.tab-content').forEach(c=>{c.style.display='none';c.classList.remove('active');});
+    const tc=document.getElementById('mypapers-'+tab);tc.style.display='block';tc.classList.add('active');
+  });
+});
+
+async function loadUsers(){
+  const users=await api('/api/users');
+  const list=document.getElementById('users-list');
+  list.innerHTML='';
+  users.forEach(u=>{
+    const div=document.createElement('div');
+    div.className='user-list-card';
+    div.innerHTML=
+      `<div class="user-list-head">`+
+        `<div><div class="user-list-name">${u.name}</div><div class="user-list-id">${u.user_id} · ${u.institution}</div></div>`+
+        `<div class="user-stats"><span>👁 ${u.viewed}</span><span style="color:var(--red)">♥ ${u.liked}</span><span style="color:var(--green)">🔖 ${u.saved}</span></div>`+
+      `</div>`+
+      `<div style="display:flex;flex-wrap:wrap;gap:4px">${u.research_interests.map(i=>`<span class="tag accent">${i}</span>`).join('')}</div>`+
+      `<div class="user-actions">`+
+        `<button class="btn btn-soft btn-sm" data-go="${u.user_id}">✦ Рекомендації</button>`+
+        `<button class="btn btn-outline btn-sm" data-edit='${JSON.stringify(u)}'>✎ Редагувати</button>`+
+        `<button class="btn btn-danger btn-sm" data-del="${u.user_id}" data-name="${u.name}">✕ Видалити</button>`+
+      `</div>`;
+    div.querySelector('[data-go]').addEventListener('click',()=>selectUserAndGo(u.user_id));
+    div.querySelector('[data-edit]').addEventListener('click',function(){openEditModal(JSON.parse(this.dataset.edit));});
+    div.querySelector('[data-del]').addEventListener('click',function(){deleteUser(this.dataset.del,this.dataset.name);});
+    list.appendChild(div);
+  });
+}
+function selectUserAndGo(uid){
+  S.user=uid;
+  document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active'));
+  document.querySelector('[data-page="recommend"]').classList.add('active');
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-recommend').classList.add('active');
+  document.getElementById('topbar-title').textContent='Рекомендації';
+  document.getElementById('topbar-page').textContent='recommend';
+  document.querySelectorAll('#user-grid .user-card').forEach(c=>c.classList.toggle('selected',c.dataset.uid===uid));
+  loadUserState(uid);
+}
+
+function openEditModal(u){
+  document.getElementById('edit-uid').value=u.user_id;
+  document.getElementById('edit-name').value=u.name;
+  document.getElementById('edit-inst').value=u.institution;
+  document.getElementById('edit-interests').value=u.research_interests.join(', ');
+  updateEditPreview();
+  document.getElementById('edit-error').style.display='none';
+  document.getElementById('edit-modal').classList.add('open');
+  document.getElementById('edit-name').focus();
+}
+function closeEditModal(){document.getElementById('edit-modal').classList.remove('open');}
+function updateEditPreview(){
+  const tags=document.getElementById('edit-interests').value.split(',').map(s=>s.trim()).filter(Boolean);
+  document.getElementById('edit-interests-preview').innerHTML=tags.map(t=>`<span class="tag accent">${t}</span>`).join('');
+}
+document.getElementById('edit-interests').addEventListener('input',updateEditPreview);
+document.getElementById('btn-close-edit').addEventListener('click',closeEditModal);
+document.getElementById('btn-close-edit2').addEventListener('click',closeEditModal);
+document.getElementById('edit-modal').addEventListener('click',e=>{if(e.target===document.getElementById('edit-modal'))closeEditModal();});
+document.getElementById('btn-save-edit').addEventListener('click',async()=>{
+  const uid=document.getElementById('edit-uid').value;
+  const name=document.getElementById('edit-name').value.trim();
+  const inst=document.getElementById('edit-inst').value.trim();
+  const interests=document.getElementById('edit-interests').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const errEl=document.getElementById('edit-error');
+  errEl.style.display='none';
+  if(!name){errEl.textContent="Введіть ім'я";errEl.style.display='inline';return;}
+  if(!interests.length){errEl.textContent='Вкажіть хоча б один інтерес';errEl.style.display='inline';return;}
+  const btn=document.getElementById('btn-save-edit');btn.textContent='...';btn.disabled=true;
+  try{
+    const r=await fetch('/api/users/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,institution:inst,interests})});
+    const data=await r.json();
+    if(!r.ok){errEl.textContent=data.error||'Помилка';errEl.style.display='inline';return;}
+    closeEditModal();loadUsers();
+    loadUserGrid('user-grid','user');loadUserGrid('compare-user-grid','compareUser');
+    showFlash('Профіль '+data.user.name+' оновлено','green');
+  }catch(e){errEl.textContent='Помилка';errEl.style.display='inline';}
+  finally{btn.textContent='Зберегти зміни';btn.disabled=false;}
+});
+async function deleteUser(uid,name){
+  if(!confirm(`Видалити профіль "${name}"?`))return;
+  const r=await fetch('/api/users/'+uid,{method:'DELETE'});
+  if(r.ok){if(S.user===uid)S.user=null;loadUsers();loadUserGrid('user-grid','user');loadUserGrid('compare-user-grid','compareUser');showFlash(`"${name}" видалено`,'red');}
+}
+
+document.getElementById('btn-show-add-user').addEventListener('click',()=>{
+  const form=document.getElementById('add-user-form');
+  const vis=form.style.display!=='none';
+  form.style.display=vis?'none':'block';
+  if(!vis)document.getElementById('new-name').focus();
+});
+document.getElementById('btn-cancel-user').addEventListener('click',()=>{document.getElementById('add-user-form').style.display='none';clearAddForm();});
+document.getElementById('new-interests').addEventListener('input',function(){
+  const tags=this.value.split(',').map(s=>s.trim()).filter(Boolean);
+  document.getElementById('interests-preview').innerHTML=tags.map(t=>`<span class="tag accent">${t}</span>`).join('');
+});
+['new-name','new-inst','new-interests'].forEach((id,i,arr)=>{
+  document.getElementById(id).addEventListener('keydown',e=>{if(e.key==='Enter'){if(i<arr.length-1)document.getElementById(arr[i+1]).focus();else document.getElementById('btn-save-user').click();}});
+});
+function clearAddForm(){
+  ['new-name','new-inst','new-interests'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('interests-preview').innerHTML='';
+  const e=document.getElementById('add-user-error');e.style.display='none';
+}
+function showFormError(msg){
+  const el=document.getElementById('add-user-error');el.textContent=msg;el.style.display='inline';
+  setTimeout(()=>el.style.display='none',3000);
+}
+document.getElementById('btn-save-user').addEventListener('click',async()=>{
+  const name=document.getElementById('new-name').value.trim();
+  const inst=document.getElementById('new-inst').value.trim();
+  const interests=document.getElementById('new-interests').value.split(',').map(s=>s.trim()).filter(Boolean);
+  if(!name){showFormError("Введіть своє \u0456\u043c\u2019\u044f");document.getElementById('new-name').focus();return;}
+  if(!interests.length){showFormError('Вкажіть хоча б один інтерес');document.getElementById('new-interests').focus();return;}
+  const btn=document.getElementById('btn-save-user');btn.textContent='...';btn.disabled=true;
+  try{
+    const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,institution:inst,interests})});
+    const data=await r.json();
+    if(!r.ok){showFormError(data.error||'Помилка');return;}
+    document.getElementById('add-user-form').style.display='none';clearAddForm();
+    loadUsers();loadUserGrid('user-grid','user');loadUserGrid('compare-user-grid','compareUser');
+    showFlash('Профіль '+data.user.name+' ('+data.user.user_id+') створено','green');
+  }catch(e){showFormError('Помилка');}
+  finally{btn.textContent='Зберегти';btn.disabled=false;}
+});
+
+async function loadArchitecture(){
+  const data=await api('/api/status');
+  const sub=data.services?.sub||[];
+  const cb=sub.find(s=>s.service==='ContentBasedService')||{};
+  const cf=sub.find(s=>s.service==='CollaborativeFilteringService')||{};
+  const kg=sub.find(s=>s.service==='KnowledgeGraphService')||{};
+  const hy=data.services||{};
+  if(cb.vocab_size)document.getElementById('arch-cb-vocab').textContent=cb.vocab_size.toLocaleString();
+  if(cb.papers_indexed)document.getElementById('arch-cb-papers').textContent=cb.papers_indexed;
+  if(cf.matrix_shape)document.getElementById('arch-cf-matrix').textContent=cf.matrix_shape;
+  if(cf.explained_variance)document.getElementById('arch-cf-var').textContent=cf.explained_variance;
+  if(kg.nodes)document.getElementById('arch-kg-nodes').textContent=kg.nodes;
+  if(kg.edges)document.getElementById('arch-kg-edges').textContent=kg.edges;
+  if(kg.keywords)document.getElementById('arch-kg-kw').textContent=kg.keywords;
+  const wr=document.getElementById('weight-rows');wr.innerHTML='';
+  const cols={'content_based':'#3b82f6','collaborative':'#16a34a','knowledge_graph':'#d97706'};
+  const labels={'content_based':'📄 Content-Based','collaborative':'👥 Collaborative','knowledge_graph':'🔗 Knowledge Graph'};
+  const weights=hy.weights||{content_based:.4,collaborative:.35,knowledge_graph:.25};
+  Object.entries(weights).forEach(([k,v])=>{
+    wr.innerHTML+=`<div class="wt-row"><div class="wt-name">${labels[k]||k}</div><div class="wt-bar"><div class="wt-fill" style="width:${v*100}%;background:${cols[k]||'#94a3b8'}"></div></div><div class="wt-pct">${Math.round(v*100)}%</div></div>`;
+  });
+  const statsEl=document.getElementById('arch-stats');
+  statsEl.innerHTML=`
+    <div class="stat-card"><div class="stat-val">${data.papers||200}</div><div class="stat-label">Статей</div></div>
+    <div class="stat-card"><div class="stat-val">${data.users||5}</div><div class="stat-label">Профілів</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:#2563eb">${cb.vocab_size||'—'}</div><div class="stat-label">TF-IDF токени</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:#d97706">${kg.edges||'—'}</div><div class="stat-label">Ребра графу</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:#7c3aed">${cf.explained_variance||'—'}</div><div class="stat-label">SVD дисперсія</div></div>
+    <div class="stat-card"><div class="stat-val">3</div><div class="stat-label">ML моделі</div></div>`;
+}
+
+function loadCompareUsers(){loadUserGrid('compare-user-grid','compareUser');}
+document.getElementById('btn-compare').addEventListener('click',async()=>{
+  if(!S.compareUser){showFlash('Оберіть профіль','red');return;}
+  const el=document.getElementById('compare-results');
+  el.innerHTML='<div class="loader"><div class="spinner"></div><div class="loader-text">Запит до всіх моделей…</div></div>';
+  const data=await api(`/api/recommend/${S.compareUser}?top_k=8&diversity=0.0`);
+  if(data.error){el.innerHTML=`<div class="empty">${data.error}</div>`;return;}
+  const byModel={content_based:[],collaborative:[],knowledge_graph:[],hybrid:[]};
+  data.recommendations.forEach(rec=>{byModel.hybrid.push(rec);rec.models.forEach(m=>{if(byModel[m])byModel[m].push(rec);});});
+  el.innerHTML='';
+  const wrap=document.createElement('div');wrap.className='cmp-grid';
+  [{key:'content_based',label:'📄 Content-Based',color:'#2563eb'},
+   {key:'collaborative', label:'👥 Collaborative', color:'#16a34a'},
+   {key:'knowledge_graph',label:'🔗 Knowledge Graph',color:'#d97706'},
+   {key:'hybrid',        label:'⚡ Hybrid Ensemble',color:'#7c3aed'}].forEach(col=>{
+    const card=document.createElement('div');card.className='cmp-col';
+    const items=byModel[col.key].slice(0,5);
+    card.innerHTML=
+      `<div class="cmp-head"><div class="cmp-head-label" style="color:${col.color}">${col.label}</div><div class="cmp-head-count">${items.length} результатів</div></div>`+
+      `<div class="cmp-body">`+
+      (items.length===0?'<div style="font-size:11px;color:var(--ink3);padding:6px">Недостатньо взаємодій</div>':
+        items.map((r,i)=>
+          `<div class="cmp-item"><div class="cmp-num" style="color:${col.color}">${i+1}</div>`+
+          `<div><div class="cmp-text">${r.paper.title.substring(0,55)}${r.paper.title.length>55?'…':''}</div>`+
+          `<div class="cmp-meta">${r.paper.venue} ${r.paper.year} · ${r.paper.citations} cit.</div></div></div>`).join(''))+
+      `</div>`;
+    wrap.appendChild(card);
+  });
+  el.appendChild(wrap);
+});
+
+async function loadUserState(uid){
+  if(!uid){S.userState={viewed:[],liked:[],saved:[]};updateLikedBadge();return;}
+  try{
+    const data=await api('/api/users/'+uid+'/history');
+    S.userState.viewed=(data.viewed||[]).map(p=>p.id);
+    S.userState.liked=(data.liked||[]).map(p=>p.id);
+    S.userState.saved=(data.saved||[]).map(p=>p.id);
+    updateLikedBadge();
+  }catch(e){}
+}
+function updateLikedBadge(){const el=document.getElementById('badge-liked');if(el)el.textContent=S.userState.liked.length;}
+async function doInteract(paperId,action,cardDiv){
+  if(!S.user)return;
+  const r=await fetch('/api/interact',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:S.user,paper_id:paperId,action})});
+  const data=await r.json();
+  if(!data.ok)return;
+  S.userState.viewed=data.viewed;S.userState.liked=data.liked;S.userState.saved=data.saved;
+  if(cardDiv)refreshCardState(cardDiv,S.userState);
+  document.querySelectorAll('.paper-card[data-paper-id="'+paperId+'"]').forEach(d=>{if(d!==cardDiv)refreshCardState(d,S.userState);});
+  updateLikedBadge();
+}
+function refreshCardState(div,state){
+  const pid=div.dataset.paperId;if(!pid)return;
+  const isV=state.viewed.includes(pid);
+  const isL=state.liked.includes(pid);
+  const iS=state.saved.includes(pid);
+  const bV=div.querySelector('.btn-view');const bL=div.querySelector('.btn-like');const bS=div.querySelector('.btn-save');
+  const meta=div.querySelector('.paper-meta');
+  if(bV){bV.classList.toggle('saved',isV);bV.textContent=isV?'✓ Прочитано':'👁 Прочитано';}
+  if(bL){bL.classList.toggle('liked',isL);bL.textContent=isL?'♥ Лайкнуто':'♥ Лайк';}
+  if(bS){bS.classList.toggle('saved',iS);bS.textContent=iS?'🔖 Збережено':'🔖 Зберегти';}
+  if(meta){
+    const ex=meta.querySelector('.viewed-chip');
+    if(isV&&!ex){const chip=document.createElement('span');chip.className='meta-chip viewed-chip';chip.textContent='✓ Прочитано';meta.appendChild(chip);}
+    else if(!isV&&ex)ex.remove();
+  }
+}
+
+function makePaperCard(rec,showScore){
+  const p=rec.paper;
+  const div=document.createElement('div');
+  div.className='paper-card';div.dataset.paperId=p.id;
+  const authExtra=p.authors.length>3?' +'+(p.authors.length-3):'';
+  const mbCls={'content_based':'mb-cb','collaborative':'mb-cf','knowledge_graph':'mb-kg'};
+  const mbLbl={'content_based':'CB','collaborative':'CF','knowledge_graph':'KG'};
+  const modelBadges=(rec.models||[]).map(m=>`<span class="model-badge ${mbCls[m]||''}">${mbLbl[m]||m}</span>`).join('');
+  const isV=S.userState.viewed.includes(p.id);
+  const isL=S.userState.liked.includes(p.id);
+  const iS=S.userState.saved.includes(p.id);
+  const scoreBar=showScore&&rec.score>0?
+    `<div class="paper-score"><span class="score-label">score</span><div class="score-bar-wrap"><div class="score-bar-fill" style="width:${rec.score*100}%"></div></div><span class="score-val">${rec.score.toFixed(3)}</span></div>`:'';
+  const reasons=(rec.reasons||[]).slice(0,1).map(r=>`<div class="paper-reason">${r}</div>`).join('');
+  div.innerHTML=
+    `<div class="paper-header"><div class="paper-rank-badge">${rec.rank||'·'}</div><div class="paper-title">${p.title}</div></div>`+
+    `<div style="font-size:11px;color:var(--ink3);margin-bottom:7px;font-family:var(--font-mono)">${p.authors.slice(0,3).map(a=>a.name).join(', ')}${authExtra}</div>`+
+    `<div class="paper-meta">`+
+      `<span class="meta-chip chip-venue">${p.venue}</span>`+
+      `<span class="meta-chip chip-year">${p.year}</span>`+
+      (p.open_access?'<span class="meta-chip chip-oa">Open Access</span>':'')+
+      `<span class="meta-chip chip-cite">⭑ ${p.citations}</span>`+
+      (isV?'<span class="meta-chip viewed-chip">✓ Прочитано</span>':'')+
+    `</div>`+scoreBar+
+    `<div class="paper-keywords">${p.keywords.map(k=>`<span class="tag">${k}</span>`).join('')}</div>`+
+    (modelBadges?`<div class="paper-models">${modelBadges}</div>`:'')+reasons+
+    `<div class="paper-abstract">${p.abstract}</div>`+
+    `<div class="action-bar">`+
+      (p.doi?`<a href="https://doi.org/${p.doi}" target="_blank" class="act-btn">DOI ↗</a>`:'')+
+      `<button class="act-btn btn-similar">◎ Схожі</button>`+
+      (S.user?
+        `<button class="act-btn btn-view${isV?' saved':''}">${isV?'✓ Прочитано':'👁 Прочитано'}</button>`+
+        `<button class="act-btn btn-like${isL?' liked':''}">${isL?'♥ Лайкнуто':'♥ Лайк'}</button>`+
+        `<button class="act-btn btn-save${iS?' saved':''}">${iS?'🔖 Збережено':'🔖 Зберегти'}</button>`:'')+
+    `</div>`;
+  div.querySelector('.paper-title').addEventListener('click',()=>div.classList.toggle('expanded'));
+  div.querySelector('.btn-similar').addEventListener('click',()=>loadSimilar(p.id,p.title.substring(0,40)));
+  if(S.user){
+    div.querySelector('.btn-view').addEventListener('click',function(){if(!this.classList.contains('saved'))doInteract(p.id,'view',div);});
+    div.querySelector('.btn-like').addEventListener('click',function(){doInteract(p.id,this.classList.contains('liked')?'unlike':'like',div);});
+    div.querySelector('.btn-save').addEventListener('click',function(){doInteract(p.id,this.classList.contains('saved')?'unsave':'save',div);});
+  }
+  return div;
+}
+
+async function loadSimilar(pid,titleShort){
+  const overlay=document.createElement('div');
+  overlay.className='sim-overlay';
+  overlay.innerHTML=
+    `<div class="sim-box">`+
+      `<div class="sim-head">`+
+        `<div><div style="font-family:var(--font-head);font-size:16px;font-weight:500">Схожі статті</div><div style="font-size:11px;color:var(--ink3);font-family:var(--font-mono);margin-top:1px">${titleShort}…</div></div>`+
+        `<button id="btn-close-sim" class="modal-close">×</button>`+
+      `</div>`+
+      `<div class="sim-body" id="sim-body"><div class="loader"><div class="spinner"></div><div class="loader-text">Пошук схожих…</div></div></div>`+
+    `</div>`;
+  overlay.addEventListener('click',e=>{if(e.target===overlay)overlay.remove();});
+  document.body.appendChild(overlay);
+  document.getElementById('btn-close-sim').addEventListener('click',()=>overlay.remove());
+  try{
+    const data=await api('/api/similar/'+pid);
+    const body=document.getElementById('sim-body');body.innerHTML='';
+    if(!data.length){body.innerHTML='<div class="empty"><div class="empty-icon">◎</div><div>Схожих не знайдено</div></div>';return;}
+    const list=document.createElement('div');list.className='papers-list';
+    data.forEach((r,i)=>list.appendChild(makePaperCard({rank:i+1,score:r.score,models:[],reasons:['📄 Content similarity'],paper:r.paper},true)));
+    body.appendChild(list);
+  }catch(e){document.getElementById('sim-body').innerHTML='<div class="empty"><div>Помилка</div></div>';}
+}
+
+document.getElementById('user-grid').addEventListener('click',async e=>{
+  const card=e.target.closest('.user-card');
+  if(card&&card.dataset.uid)await loadUserState(card.dataset.uid);
+});
+
+loadStatus();
+</script>
+</body>
+</html>"""
+
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import sys
+    print("\n" + "═"*60)
+    print("  SciRec — Мікросервісна система рекомендацій")
+    print("═"*60)
+    SYS = RecommendationSystem()
+    print("\n  ✓ Система готова!")
+    print("  ✦ Відкрийте браузер: http://localhost:5000")
+    print("  ✦ Натисніть Ctrl+C для зупинки\n")
+    app.run(debug=False, port=5000, host="0.0.0.0")
