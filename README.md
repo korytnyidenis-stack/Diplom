@@ -28,26 +28,6 @@ Knowledge Graph	Аналіз зв’язків між статтями та кл
 
 Підсумкова рекомендація формується як зважена комбінація всіх моделей.
 
-Архітектура системи
-Користувач
-    │
-    ▼
-Flask REST API
-    │
-    ├── Content-Based Service
-    │       └── TF-IDF + Cosine Similarity
-    │
-    ├── Collaborative Filtering Service
-    │       └── SVD Matrix Factorization
-    │
-    ├── Knowledge Graph Service
-    │       └── PageRank
-    │
-    ▼
-Hybrid Recommendation Service
-    │
-    ▼
-Рекомендовані статті
 Використані технології
 Backend
 Python 3.9+
